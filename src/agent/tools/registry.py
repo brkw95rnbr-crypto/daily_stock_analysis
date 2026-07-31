@@ -44,6 +44,7 @@ class ToolPolicy:
     policy_status: str = "unknown"
     scope_dimensions: List[str] = field(default_factory=list)
     cancellation_safe: bool = False
+    timeout_seconds: Optional[float] = None
 
     @classmethod
     def unknown(cls) -> "ToolPolicy":
@@ -58,6 +59,7 @@ class ToolPolicy:
         permissions: Optional[List[str]] = None,
         scope_dimensions: Optional[List[str]] = None,
         cancellation_safe: bool = False,
+        timeout_seconds: Optional[float] = None,
     ) -> "ToolPolicy":
         return cls(
             read_only=read_only,
@@ -66,6 +68,7 @@ class ToolPolicy:
             policy_status="declared",
             scope_dimensions=list(scope_dimensions or []),
             cancellation_safe=bool(cancellation_safe),
+            timeout_seconds=timeout_seconds,
         )
 
     def to_public_dict(self) -> Dict[str, Any]:
@@ -87,6 +90,7 @@ class ToolDefinition:
     handler: Callable
     category: str = "data"  # data | analysis | search | action
     policy: ToolPolicy = field(default_factory=ToolPolicy.unknown)
+    timeout_seconds: Optional[float] = None  # Optional per-tool execution timeout
 
     # ----- Multi-provider schema converters -----
 
@@ -172,8 +176,9 @@ class ToolRegistry:
         registry.execute("get_realtime_quote", stock_code="600519")
     """
 
-    def __init__(self):
+    def __init__(self, category_timeout_map: Optional[Dict[str, float]] = None):
         self._tools: Dict[str, ToolDefinition] = {}
+        self._category_timeouts: Dict[str, float] = dict(category_timeout_map or {})
 
     # ----- Registration -----
 
@@ -214,6 +219,14 @@ class ToolRegistry:
 
     def __contains__(self, name: str) -> bool:
         return name in self._tools
+
+    def category_default_timeout(self, category: str) -> Optional[float]:
+        """Return the configured default timeout (seconds) for a tool category.
+
+        Returns ``None`` when no default is configured, letting the caller fall
+        back to the global ``tool_call_timeout_seconds`` budget.
+        """
+        return self._category_timeouts.get(category)
 
     # ----- Schema generation -----
 
@@ -315,6 +328,7 @@ def tool(
     parameters: Optional[List[ToolParameter]] = None,
     registry: Optional[ToolRegistry] = None,
     policy: Optional[ToolPolicy] = None,
+    timeout_seconds: Optional[float] = None,
 ):
     """Decorator to register a function as an agent tool.
 
@@ -340,6 +354,7 @@ def tool(
             handler=func,
             category=category,
             policy=policy or ToolPolicy.unknown(),
+            timeout_seconds=timeout_seconds,
         )
 
         target_registry = registry or get_default_registry()
@@ -403,3 +418,31 @@ def _infer_parameters(func: Callable) -> List[ToolParameter]:
         params.append(tp)
 
     return params
+
+
+def _resolve_tool_timeout(*candidates: Optional[float]) -> Optional[float]:
+    """Resolve an effective tool timeout from a priority chain.
+
+    Accepts any number of candidate timeouts (e.g. explicit call argument,
+    per-tool declaration, category default, remaining wall-clock budget) and
+    returns the smallest positive, non-zero value.  ``None``/``0`` candidates
+    are ignored (treated as "no limit at this level").  Returns ``None`` when
+    no positive candidate exists, meaning "no per-tool timeout" — the caller's
+    global budget (if any) still applies.
+
+    The result is the *minimum* across all candidates so a per-tool or
+    category timeout can never exceed the caller's remaining budget.
+    """
+    effective: Optional[float] = None
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        if effective is None or value < effective:
+            effective = value
+    return effective

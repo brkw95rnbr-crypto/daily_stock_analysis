@@ -186,7 +186,19 @@ def get_tool_registry():
     from src.agent.tools.market_tools import ALL_MARKET_TOOLS
     from src.agent.tools.backtest_tools import ALL_BACKTEST_TOOLS
 
-    registry = ToolRegistry()
+    from src.config import get_config
+    config = get_config()
+    category_timeout_map = {
+        "data": config.agent_data_tool_timeout_s,
+        "search": config.agent_search_tool_timeout_s,
+        "analysis": config.agent_analysis_tool_timeout_s,
+        "action": config.agent_action_tool_timeout_s,
+    }
+    # Only carry explicit overrides; 0.0 means "no category limit, fall back
+    # to the global tool_call_timeout_seconds budget".
+    category_timeout_map = {k: v for k, v in category_timeout_map.items() if v and v > 0}
+
+    registry = ToolRegistry(category_timeout_map=category_timeout_map or None)
     for tool_fn in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_SEARCH_TOOLS + ALL_MARKET_TOOLS + ALL_BACKTEST_TOOLS:
         registry.register(tool_fn)
 
