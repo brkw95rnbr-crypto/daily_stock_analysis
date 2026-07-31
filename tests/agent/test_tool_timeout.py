@@ -2,7 +2,7 @@
 """Unit tests for agent tool timeout resolution (Issue #1890).
 
 Covers:
-- the pure ``_resolve_tool_timeout`` priority resolver
+- the pure ``_resolve_tool_timeout`` minimum resolver
 - registry / policy / definition timeout fields
 - ``_resolve_per_tool_timeout`` wiring
 - end-to-end ``_execute_tools`` per-tool timeout + fail-open behaviour
@@ -244,3 +244,22 @@ class TestConfigEnvContract:
             minimum=0.0,
         )
         assert val == 20.0
+
+
+# ---------------------------------------------------------------------------
+# 6. Category coverage (Issue #1890 review: market tools must get a ceiling)
+# ---------------------------------------------------------------------------
+class TestCategoryTimeoutMap:
+    def test_market_tools_share_data_timeout(self):
+        from src.agent.factory import _build_category_timeout_map
+
+        config = SimpleNamespace(
+            agent_data_tool_timeout_s=15.0,
+            agent_search_tool_timeout_s=0.0,
+            agent_analysis_tool_timeout_s=0.0,
+            agent_action_tool_timeout_s=0.0,
+        )
+        mapping = _build_category_timeout_map(config)
+        assert mapping["data"] == 15.0
+        assert mapping["market"] == 15.0
+        assert "search" not in mapping

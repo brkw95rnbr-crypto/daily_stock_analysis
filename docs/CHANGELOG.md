@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] 本地 CLI 的 `stdout_preview` / `stderr_preview` 按环境变量、JSON、YAML/日志标量与 URL 的独立契约脱敏短凭证，避免小于 32 字符的 API key、secret 或 token 进入诊断；普通字段仅按敏感名称判定，未加引号的 YAML 敏感标量则 fail-closed 脱敏至行尾（refs #1784）。
 - [修复] `redact_diagnostic_text()` 在 `export SENSITIVE_ENV=$(printenv OTHER_SECRET) session_id=...` 形态下不再因第二遍 `$(...)` 扫描与第一遍敏感赋值替换区重叠而吞掉 `session_id` 等尾随非敏感诊断字段；第二遍扫描现以 first-pass 已替换 span 列表为可信跳过表，并对 prior-head / prior-semicolon 分支的 leading regex 加上 `(?:export[ \t]+)?` 前缀，使 `export FOO=$(...)` 与 `FOO=$(...)` 在所有分支行为对齐（关闭 PR #2118 review blocker OR-COR-7c0a5d41）。
-- [新功能] Agent 工具调用支持按类别（data/search/analysis/action）配置默认超时，并允许单工具声明 `timeout_seconds`；超时解析优先级为显式调用参数 > 单工具声明 > 类别默认 > 全局预算，超时后返回结构化 `{"timeout": true}` 错误供 Agent 继续执行而非中断循环（fixes #1890）。
+- [新功能] Agent 工具调用支持按类别（data/search/analysis/action/market）配置默认超时，并允许单工具声明 `timeout_seconds`；有效超时取各候选的最小值（min），即 `min(显式调用参数, 单工具声明, 类别默认, 全局预算)`，最小正约束生效，超时后返回结构化 `{"timeout": true}` 错误供 Agent 继续执行而非中断循环（fixes #1890）。
 
 ## [3.28.0] - 2026-07-26
 

@@ -173,6 +173,28 @@ def _should_use_legacy_default_prompt(
     return getattr(bull_trend_skill, "source", None) == "builtin"
 
 
+def _build_category_timeout_map(config) -> dict:
+    """Map tool categories to their default timeout (seconds) from config.
+
+    Only explicit overrides (value > 0) are carried; 0.0 means "no category
+    limit, fall back to the global tool_call_timeout_seconds budget".
+
+    ``market`` tools (get_market_indices / get_sector_rankings) are
+    network-backed data calls, so they share the ``data`` ceiling.
+    """
+    return {
+        k: v
+        for k, v in {
+            "data": config.agent_data_tool_timeout_s,
+            "search": config.agent_search_tool_timeout_s,
+            "analysis": config.agent_analysis_tool_timeout_s,
+            "action": config.agent_action_tool_timeout_s,
+            "market": config.agent_data_tool_timeout_s,
+        }.items()
+        if v and v > 0
+    }
+
+
 def get_tool_registry():
     """Return a cached ToolRegistry (built once, shared across requests)."""
     global _TOOL_REGISTRY
@@ -188,15 +210,7 @@ def get_tool_registry():
 
     from src.config import get_config
     config = get_config()
-    category_timeout_map = {
-        "data": config.agent_data_tool_timeout_s,
-        "search": config.agent_search_tool_timeout_s,
-        "analysis": config.agent_analysis_tool_timeout_s,
-        "action": config.agent_action_tool_timeout_s,
-    }
-    # Only carry explicit overrides; 0.0 means "no category limit, fall back
-    # to the global tool_call_timeout_seconds budget".
-    category_timeout_map = {k: v for k, v in category_timeout_map.items() if v and v > 0}
+    category_timeout_map = _build_category_timeout_map(config)
 
     registry = ToolRegistry(category_timeout_map=category_timeout_map or None)
     for tool_fn in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_SEARCH_TOOLS + ALL_MARKET_TOOLS + ALL_BACKTEST_TOOLS:

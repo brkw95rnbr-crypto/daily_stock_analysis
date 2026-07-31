@@ -608,10 +608,11 @@ def _resolve_per_tool_timeout(
 ) -> Optional[float]:
     """Resolve the effective timeout for a single tool call.
 
-    Priority chain (smallest positive wins, ``None``/``0`` ignored):
-    per-tool declaration > category default > caller's global timeout (which
-    already encodes the remaining wall-clock budget).  Returns ``None`` when
-    nothing sets a limit, so the caller's global budget still governs.
+    Effective timeout is the *minimum* across candidates (smallest positive
+    wins; ``None``/``0`` ignored): per-tool declaration, category default, and
+    the caller's global timeout (which already encodes the remaining
+    wall-clock budget).  Returns ``None`` when nothing sets a limit, so the
+    caller's global budget still governs.
     """
     if tool_registry is None:
         return _resolve_tool_timeout(global_timeout)

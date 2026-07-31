@@ -88,7 +88,7 @@ class ToolDefinition:
     description: str
     parameters: List[ToolParameter]
     handler: Callable
-    category: str = "data"  # data | analysis | search | action
+    category: str = "data"  # data | analysis | search | action | market
     policy: ToolPolicy = field(default_factory=ToolPolicy.unknown)
     timeout_seconds: Optional[float] = None  # Optional per-tool execution timeout
 
@@ -421,7 +421,7 @@ def _infer_parameters(func: Callable) -> List[ToolParameter]:
 
 
 def _resolve_tool_timeout(*candidates: Optional[float]) -> Optional[float]:
-    """Resolve an effective tool timeout from a priority chain.
+    """Resolve an effective tool timeout as the minimum across candidates.
 
     Accepts any number of candidate timeouts (e.g. explicit call argument,
     per-tool declaration, category default, remaining wall-clock budget) and
