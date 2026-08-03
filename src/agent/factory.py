@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 # Module-level caches
 # ---------------------------------------------------------------------------
 _TOOL_REGISTRY = None
+# Track the id() of the config used to build ``_TOOL_REGISTRY`` so callers that
+# pass a freshly-built/reloaded ``Config`` instance always observe the right
+# per-category timeout mapping instead of inheriting the first build's values.
+# Pair with :func:`reset_tool_registry` for runtime config reload paths.
+_CACHED_CONFIG_ID: Optional[int] = None
 _SKILL_MANAGER_PROTOTYPE = None
 # Sentinel used as initial value so None (i.e. no custom dir) compares as "changed"
 # on the very first call, forcing a build rather than accidentally skipping it.
@@ -195,10 +200,46 @@ def _build_category_timeout_map(config) -> dict:
     }
 
 
-def get_tool_registry():
-    """Return a cached ToolRegistry (built once, shared across requests)."""
-    global _TOOL_REGISTRY
+def reset_tool_registry() -> None:
+    """Drop the cached :class:`ToolRegistry` so the next access rebuilds it.
+
+    Intended for runtime config reload paths
+    (``main._reload_runtime_config`` /
+    ``SystemConfigService._reload_runtime_singletons``) so that newly-loaded
+    ``AGENT_*_TOOL_TIMEOUT_S`` overrides actually take effect on subsequent
+    :func:`build_agent_executor` / :func:`build_agent_chat_executor` calls,
+    instead of being silently shadowed by the registry built at first import.
+    """
+    global _TOOL_REGISTRY, _CACHED_CONFIG_ID
     if _TOOL_REGISTRY is not None:
+        logger.info("[AgentFactory] ToolRegistry cache cleared; will rebuild on next access")
+    _TOOL_REGISTRY = None
+    _CACHED_CONFIG_ID = None
+
+
+def get_tool_registry(config=None):
+    """Return a :class:`ToolRegistry` bound to the lifetime of ``config``.
+
+    The first call (or the first call after :func:`reset_tool_registry`)
+    builds and caches a registry from ``config``.  The cache is keyed by
+    ``id(config)``: a subsequent call with a *different* ``config`` object
+    (e.g. a freshly-reloaded ``Config`` singleton) rebuilds the registry so
+    that per-category timeouts reflect the caller's current configuration;
+    a call with the *same* ``config`` object reuses the cached instance.
+
+    When ``config`` is ``None`` the function falls back to ``get_config()``,
+    preserving the legacy contract for callers that do not yet know about
+    config reload.
+    """
+    global _TOOL_REGISTRY, _CACHED_CONFIG_ID
+
+    if config is None:
+        from src.config import get_config
+
+        config = get_config()
+
+    cached_config_id = id(config)
+    if _TOOL_REGISTRY is not None and _CACHED_CONFIG_ID == cached_config_id:
         return _TOOL_REGISTRY
 
     from src.agent.tools.registry import ToolRegistry
@@ -208,16 +249,32 @@ def get_tool_registry():
     from src.agent.tools.market_tools import ALL_MARKET_TOOLS
     from src.agent.tools.backtest_tools import ALL_BACKTEST_TOOLS
 
-    from src.config import get_config
-    config = get_config()
     category_timeout_map = _build_category_timeout_map(config)
 
     registry = ToolRegistry(category_timeout_map=category_timeout_map or None)
-    for tool_fn in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_SEARCH_TOOLS + ALL_MARKET_TOOLS + ALL_BACKTEST_TOOLS:
+    for tool_fn in (
+        ALL_DATA_TOOLS
+        + ALL_ANALYSIS_TOOLS
+        + ALL_SEARCH_TOOLS
+        + ALL_MARKET_TOOLS
+        + ALL_BACKTEST_TOOLS
+    ):
         registry.register(tool_fn)
 
+    invalidated = _TOOL_REGISTRY is not None
     _TOOL_REGISTRY = registry
-    logger.info("[AgentFactory] ToolRegistry cached (%d tools)", len(registry._tools) if hasattr(registry, "_tools") else -1)
+    _CACHED_CONFIG_ID = cached_config_id
+    if invalidated:
+        logger.info(
+            "[AgentFactory] ToolRegistry rebuilt against new config (id=%s)",
+            cached_config_id,
+        )
+    else:
+        logger.info(
+            "[AgentFactory] ToolRegistry cached (%d tools, config id=%s)",
+            len(registry._tools) if hasattr(registry, "_tools") else -1,
+            cached_config_id,
+        )
     return _TOOL_REGISTRY
 
 
@@ -345,7 +402,11 @@ def build_agent_executor(config=None, skills: Optional[List[str]] = None):
 
     from src.agent.llm_adapter import LLMToolAdapter
 
-    registry = get_tool_registry()
+    # Pass ``config`` explicitly so a reloaded ``Config`` instance observes
+    # the new per-category timeout map (Issue #1890 compatibility concern:
+    # the module-level ToolRegistry would otherwise keep the first build's
+    # timeouts even after ``_reload_runtime_config``).
+    registry = get_tool_registry(config)
     prompt_state = resolve_skill_prompt_state(config, skills=skills)
     skill_manager = prompt_state.skill_manager
     logger.info(
@@ -415,7 +476,10 @@ def build_agent_chat_executor(config=None, skills: Optional[List[str]] = None):
     if backend_id == "litellm" and arch == "multi":
         return build_agent_executor(config, skills=skills)
 
-    registry = get_tool_registry()
+    # Pass ``config`` explicitly so a reloaded ``Config`` instance observes
+    # the new per-category timeout map (see ``build_agent_executor`` for the
+    # same rationale).
+    registry = get_tool_registry(config)
     prompt_state = resolve_skill_prompt_state(config, skills=skills)
     if backend_id == "litellm":
         from src.agent.llm_adapter import LLMToolAdapter
