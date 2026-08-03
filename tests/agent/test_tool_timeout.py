@@ -430,6 +430,34 @@ class TestToolRegistryCacheInvalidation:
             # ToolRegistry was instantiated exactly once across three calls.
             assert registry_cls.call_count == 1
 
+    def test_build_agent_executor_forwards_config_to_registry(self):
+        """Regression for review blockers OR-COM-dd1e8fa7 / OR-COM-bff42110: the
+        builder must hand its *caller-supplied* ``config`` to
+        ``get_tool_registry`` so a distinct / updated config actually re-binds
+        the category timeouts instead of silently reusing the first cached
+        registry built from a frozen default config.
+        """
+        from src.agent import factory
+
+        config = SimpleNamespace(
+            agent_data_tool_timeout_s=12.0,
+            agent_search_tool_timeout_s=0.0,
+            agent_analysis_tool_timeout_s=0.0,
+            agent_action_tool_timeout_s=0.0,
+            agent_arch="single",
+        )
+        with patch.object(factory, "get_tool_registry") as gtr, patch.object(
+            factory, "resolve_skill_prompt_state"
+        ) as rsp, patch("src.agent.llm_adapter.LLMToolAdapter"), patch(
+            "src.agent.executor.AgentExecutor"
+        ) as ae_cls:
+            gtr.return_value = MagicMock(name="registry")
+            rsp.return_value = MagicMock(skill_manager=MagicMock())
+            factory.build_agent_executor(config)
+            # The registry is (re)built from THIS config, not a frozen default.
+            assert gtr.call_args == ((config,),)
+            assert ae_cls.call_args.kwargs["tool_registry"] is gtr.return_value
+
     def test_rebuild_survives_config_instance_id_reuse(self):
         """A reloaded ``Config`` must be honoured even when CPython hands the
         new instance the *same* ``id()`` as the collected one.
