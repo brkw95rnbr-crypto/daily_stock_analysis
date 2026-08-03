@@ -37,11 +37,17 @@ logger = logging.getLogger(__name__)
 # Module-level caches
 # ---------------------------------------------------------------------------
 _TOOL_REGISTRY = None
-# Track the id() of the config used to build ``_TOOL_REGISTRY`` so callers that
-# pass a freshly-built/reloaded ``Config`` instance always observe the right
-# per-category timeout mapping instead of inheriting the first build's values.
-# Pair with :func:`reset_tool_registry` for runtime config reload paths.
-_CACHED_CONFIG_ID: Optional[int] = None
+# Track the per-category timeout mapping ``_TOOL_REGISTRY`` was built from, so
+# callers passing a freshly-reloaded ``Config`` always observe the right
+# ceilings instead of inheriting the first build's values.
+#
+# Deliberately keyed by *value* rather than ``id(config)``: CPython reuses the
+# address of a freed object, so a ``Config.reset_instance()`` + ``get_config()``
+# round-trip can hand back a new instance with the *same* id() as the collected
+# one, which would silently mark a changed config as "unchanged".  This mirrors
+# the ``_SKILL_MANAGER_CUSTOM_DIR`` value-comparison used by ``get_skill_manager``
+# below.  Pair with :func:`reset_tool_registry` for runtime config reload paths.
+_CACHED_TIMEOUT_MAP: Optional[dict] = None
 _SKILL_MANAGER_PROTOTYPE = None
 # Sentinel used as initial value so None (i.e. no custom dir) compares as "changed"
 # on the very first call, forcing a build rather than accidentally skipping it.
@@ -178,6 +184,46 @@ def _should_use_legacy_default_prompt(
     return getattr(bull_trend_skill, "source", None) == "builtin"
 
 
+def _coerce_config_timeout(config, field_name: str) -> float:
+    """Read a timeout field off ``config`` as a float, defaulting to ``0.0``.
+
+    ``get_tool_registry`` builds its category map from the *caller-supplied*
+    config, so it must tolerate partial config objects and test doubles: a
+    missing attribute raises ``AttributeError`` and ``MagicMock() > 0`` raises
+    ``TypeError``.  A plain ``float()`` conversion is not enough either --
+    ``float(MagicMock())`` silently yields ``1.0``, which would quietly impose
+    a bogus 1-second ceiling on every tool.  Only genuine numbers (or numeric
+    strings, since ``.env`` values arrive as text) are accepted; anything else
+    degrades to "no category limit" and defers to the global
+    ``tool_call_timeout_seconds`` budget.
+    """
+    raw_value = getattr(config, field_name, None)
+
+    if isinstance(raw_value, bool) or raw_value is None:
+        # ``True`` would coerce to a nonsensical 1-second ceiling.
+        return 0.0
+    if isinstance(raw_value, (int, float)):
+        return float(raw_value)
+    if isinstance(raw_value, str):
+        try:
+            return float(raw_value.strip())
+        except ValueError:
+            logger.warning(
+                "[AgentFactory] Invalid value for %s: %r, treating as no category limit",
+                field_name,
+                raw_value,
+            )
+            return 0.0
+
+    # Mocks / arbitrary objects: never let them shape real timeout behaviour.
+    logger.debug(
+        "[AgentFactory] Non-numeric value for %s: %r, treating as no category limit",
+        field_name,
+        type(raw_value).__name__,
+    )
+    return 0.0
+
+
 def _build_category_timeout_map(config) -> dict:
     """Map tool categories to their default timeout (seconds) from config.
 
@@ -187,16 +233,17 @@ def _build_category_timeout_map(config) -> dict:
     ``market`` tools (get_market_indices / get_sector_rankings) are
     network-backed data calls, so they share the ``data`` ceiling.
     """
+    data_timeout = _coerce_config_timeout(config, "agent_data_tool_timeout_s")
     return {
         k: v
         for k, v in {
-            "data": config.agent_data_tool_timeout_s,
-            "search": config.agent_search_tool_timeout_s,
-            "analysis": config.agent_analysis_tool_timeout_s,
-            "action": config.agent_action_tool_timeout_s,
-            "market": config.agent_data_tool_timeout_s,
+            "data": data_timeout,
+            "search": _coerce_config_timeout(config, "agent_search_tool_timeout_s"),
+            "analysis": _coerce_config_timeout(config, "agent_analysis_tool_timeout_s"),
+            "action": _coerce_config_timeout(config, "agent_action_tool_timeout_s"),
+            "market": data_timeout,
         }.items()
-        if v and v > 0
+        if v > 0
     }
 
 
@@ -210,36 +257,41 @@ def reset_tool_registry() -> None:
     :func:`build_agent_executor` / :func:`build_agent_chat_executor` calls,
     instead of being silently shadowed by the registry built at first import.
     """
-    global _TOOL_REGISTRY, _CACHED_CONFIG_ID
+    global _TOOL_REGISTRY, _CACHED_TIMEOUT_MAP
     if _TOOL_REGISTRY is not None:
         logger.info("[AgentFactory] ToolRegistry cache cleared; will rebuild on next access")
     _TOOL_REGISTRY = None
-    _CACHED_CONFIG_ID = None
+    _CACHED_TIMEOUT_MAP = None
 
 
 def get_tool_registry(config=None):
     """Return a :class:`ToolRegistry` bound to the lifetime of ``config``.
 
     The first call (or the first call after :func:`reset_tool_registry`)
-    builds and caches a registry from ``config``.  The cache is keyed by
-    ``id(config)``: a subsequent call with a *different* ``config`` object
-    (e.g. a freshly-reloaded ``Config`` singleton) rebuilds the registry so
-    that per-category timeouts reflect the caller's current configuration;
-    a call with the *same* ``config`` object reuses the cached instance.
+    builds and caches a registry from ``config``.  The cache is keyed by the
+    resolved per-category timeout *values*, so a config carrying different
+    ``AGENT_*_TOOL_TIMEOUT_S`` settings (e.g. a freshly-reloaded ``Config``
+    singleton) rebuilds the registry, while an equivalent config reuses the
+    cached instance and avoids re-registering the whole tool surface.
+
+    Value comparison is intentional: ``id(config)`` is not a safe key because
+    CPython reuses the address of a collected object, so the instance returned
+    after ``Config.reset_instance()`` can share the previous instance's id and
+    would be misread as "unchanged".
 
     When ``config`` is ``None`` the function falls back to ``get_config()``,
     preserving the legacy contract for callers that do not yet know about
     config reload.
     """
-    global _TOOL_REGISTRY, _CACHED_CONFIG_ID
+    global _TOOL_REGISTRY, _CACHED_TIMEOUT_MAP
 
     if config is None:
         from src.config import get_config
 
         config = get_config()
 
-    cached_config_id = id(config)
-    if _TOOL_REGISTRY is not None and _CACHED_CONFIG_ID == cached_config_id:
+    category_timeout_map = _build_category_timeout_map(config)
+    if _TOOL_REGISTRY is not None and _CACHED_TIMEOUT_MAP == category_timeout_map:
         return _TOOL_REGISTRY
 
     from src.agent.tools.registry import ToolRegistry
@@ -248,8 +300,6 @@ def get_tool_registry(config=None):
     from src.agent.tools.search_tools import ALL_SEARCH_TOOLS
     from src.agent.tools.market_tools import ALL_MARKET_TOOLS
     from src.agent.tools.backtest_tools import ALL_BACKTEST_TOOLS
-
-    category_timeout_map = _build_category_timeout_map(config)
 
     registry = ToolRegistry(category_timeout_map=category_timeout_map or None)
     for tool_fn in (
@@ -263,17 +313,17 @@ def get_tool_registry(config=None):
 
     invalidated = _TOOL_REGISTRY is not None
     _TOOL_REGISTRY = registry
-    _CACHED_CONFIG_ID = cached_config_id
+    _CACHED_TIMEOUT_MAP = category_timeout_map
     if invalidated:
         logger.info(
-            "[AgentFactory] ToolRegistry rebuilt against new config (id=%s)",
-            cached_config_id,
+            "[AgentFactory] ToolRegistry rebuilt for new category timeouts: %s",
+            category_timeout_map or "none (global budget only)",
         )
     else:
         logger.info(
-            "[AgentFactory] ToolRegistry cached (%d tools, config id=%s)",
+            "[AgentFactory] ToolRegistry cached (%d tools, category timeouts: %s)",
             len(registry._tools) if hasattr(registry, "_tools") else -1,
-            cached_config_id,
+            category_timeout_map or "none (global budget only)",
         )
     return _TOOL_REGISTRY
 

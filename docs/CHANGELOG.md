@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] `redact_diagnostic_text()` 在 `export SENSITIVE_ENV=$(printenv OTHER_SECRET) session_id=...` 形态下不再因第二遍 `$(...)` 扫描与第一遍敏感赋值替换区重叠而吞掉 `session_id` 等尾随非敏感诊断字段；第二遍扫描现以 first-pass 已替换 span 列表为可信跳过表，并对 prior-head / prior-semicolon 分支的 leading regex 加上 `(?:export[ \t]+)?` 前缀，使 `export FOO=$(...)` 与 `FOO=$(...)` 在所有分支行为对齐（关闭 PR #2118 review blocker OR-COR-7c0a5d41）。
 - [新功能] Agent 工具调用支持按类别（data/search/analysis/action/market）配置默认超时，并允许单工具声明 `timeout_seconds`；有效超时取各候选的最小值（min），即 `min(显式调用参数, 单工具声明, 类别默认, 全局预算)`，最小正约束生效，超时后返回结构化 `{"timeout": true}` 错误供 Agent 继续执行而非中断循环（fixes #1890）。
 - [修复] LongbridgeFetcher._compute_volume_ratio 调用 history_candlesticks_by_offset 时把 time 与 count 两个位置参数传反，PyO3 转换层抛 argument 'time': 'int' object cannot be converted to 'PyDateTime'，异常被 try/except 静默吞到 DEBUG 日志，导致港股/美股实时行情链路上的量比字段恒为 None 并对外表现为"未获取到数据"；改用 adaptive keyword args 调用，兼容 0.2.74 (forward, time, count) 与 4.x (forward, count, time) 两种 SDK 契约，并按 keyword args 契约覆盖两版本回归测试（fixes #2100）
+- [修复] Agent 工具注册表（`src/agent/factory.get_tool_registry`）由模块级缓存改为按「类别超时映射的值」比对失效，规避 CPython 回收对象后地址复用（`id(config)` 相同）导致配置 reload 后的 `Config` 被误判为未变、沿用过期超时的真 bug；新增 `_coerce_config_timeout` 类型白名单，使调用方传入 `MagicMock` / 缺属性 stub / 脏字符串（如 `float(MagicMock())` 静默得到 1.0）时降级为「无类别限制」而非崩溃或强加 1 秒超时；`main._reload_runtime_config` 与 `SystemConfigService._reload_runtime_singletons` 在配置热重载时调用 `reset_tool_registry()` 强制重建（#1890 的 review follow-up）
 
 ## [3.29.0] - 2026-08-02
 

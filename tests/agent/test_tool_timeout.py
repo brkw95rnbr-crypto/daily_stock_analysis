@@ -13,11 +13,14 @@ global default registry.  These tests therefore register tools directly via
 ``ToolDefinition`` (the same path ``factory.get_tool_registry`` uses) instead
 of relying on the decorator's registry fallback.
 """
+import gc
 import json
 import sys
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from src.agent.factory import _build_category_timeout_map
 
@@ -275,8 +278,10 @@ class TestToolRegistryCacheInvalidation:
     ``Config`` instance.  These tests pin the contract:
 
     * ``reset_tool_registry`` empties the cache.
-    * ``get_tool_registry(config)`` rebuilds when ``id(config)`` differs
-      from the value used to build the cached instance.
+    * ``get_tool_registry(config)`` rebuilds when the resolved per-category
+      timeouts differ from the ones the cached registry was built with, and
+      does so even when the new ``Config`` instance happens to reuse the
+      collected instance's ``id()``.
     * ``SystemConfigService._reload_runtime_singletons`` actually invokes
       ``reset_tool_registry`` so API/scheduler/bot entry-points observe the
       fresh ``AGENT_*_TOOL_TIMEOUT_S`` values.
@@ -290,13 +295,13 @@ class TestToolRegistryCacheInvalidation:
         from src.agent import factory
 
         saved_registry = factory._TOOL_REGISTRY
-        saved_config_id = factory._CACHED_CONFIG_ID
+        saved_timeout_map = factory._CACHED_TIMEOUT_MAP
         factory.reset_tool_registry()
         try:
             yield
         finally:
             factory._TOOL_REGISTRY = saved_registry
-            factory._CACHED_CONFIG_ID = saved_config_id
+            factory._CACHED_TIMEOUT_MAP = saved_timeout_map
 
     def _empty_tool_lists(self):
         """Patch the ALL_*_TOOLS module-level names on ``factory`` so the
@@ -319,12 +324,12 @@ class TestToolRegistryCacheInvalidation:
         # Sanity: initial reset empties the module-level cache.
         factory.reset_tool_registry()
         assert factory._TOOL_REGISTRY is None
-        assert factory._CACHED_CONFIG_ID is None
+        assert factory._CACHED_TIMEOUT_MAP is None
 
         # Idempotent: calling reset on an empty cache is a no-op.
         factory.reset_tool_registry()
         assert factory._TOOL_REGISTRY is None
-        assert factory._CACHED_CONFIG_ID is None
+        assert factory._CACHED_TIMEOUT_MAP is None
 
     def test_get_tool_registry_rebuilds_when_config_changes(self):
         """Two callers passing two *distinct* ``Config`` instances must
@@ -369,7 +374,11 @@ class TestToolRegistryCacheInvalidation:
             assert first is not second
             # And the cache now points at the *second* one.
             assert factory._TOOL_REGISTRY is registry_instance_b
-            assert factory._CACHED_CONFIG_ID == id(config_b)
+            assert factory._CACHED_TIMEOUT_MAP == {
+                "data": 25.0,
+                "search": 5.0,
+                "market": 25.0,
+            }
             # ToolRegistry was constructed with the *matching* timeout map.
             assert registry_cls.call_args_list[0].kwargs["category_timeout_map"] == {
                 "data": 10.0,
@@ -381,13 +390,23 @@ class TestToolRegistryCacheInvalidation:
                 "market": 25.0,
             }
 
-    def test_get_tool_registry_reuses_cache_for_same_config(self):
-        """Passing the *same* ``Config`` object must reuse the cache so the
-        tool-registration cost is paid at most once per (process, config).
+    def test_get_tool_registry_reuses_cache_for_equivalent_config(self):
+        """Repeated calls carrying the same effective timeouts must reuse the
+        cache so the tool-registration cost is paid at most once.
+
+        The final call passes a *different object* with identical values: the
+        registry only depends on the resolved timeout map, so rebuilding it
+        would be pure waste on every request.
         """
         from src.agent import factory
 
         config = SimpleNamespace(
+            agent_data_tool_timeout_s=10.0,
+            agent_search_tool_timeout_s=0.0,
+            agent_analysis_tool_timeout_s=0.0,
+            agent_action_tool_timeout_s=0.0,
+        )
+        equivalent_config = SimpleNamespace(
             agent_data_tool_timeout_s=10.0,
             agent_search_tool_timeout_s=0.0,
             agent_analysis_tool_timeout_s=0.0,
@@ -405,11 +424,93 @@ class TestToolRegistryCacheInvalidation:
 
             first = factory.get_tool_registry(config)
             second = factory.get_tool_registry(config)
-            third = factory.get_tool_registry(config)
+            third = factory.get_tool_registry(equivalent_config)
 
             assert first is second is third is registry_instance
             # ToolRegistry was instantiated exactly once across three calls.
             assert registry_cls.call_count == 1
+
+    def test_rebuild_survives_config_instance_id_reuse(self):
+        """A reloaded ``Config`` must be honoured even when CPython hands the
+        new instance the *same* ``id()`` as the collected one.
+
+        ``Config.reset_instance()`` drops the only strong reference, so the
+        allocator frequently reuses that address for the replacement instance.
+        Keying the cache on ``id(config)`` would read that as "unchanged" and
+        keep serving the stale registry — exactly the bug this class guards.
+        """
+        from src.agent import factory
+
+        empty_lists = self._empty_tool_lists()
+        with patch.object(
+            factory, "_build_category_timeout_map"
+        ) as build_map, patch(
+            "src.agent.tools.registry.ToolRegistry"
+        ) as registry_cls, empty_lists[0], empty_lists[1], empty_lists[2], empty_lists[3], empty_lists[4]:
+            registry_old = MagicMock(name="registry_old")
+            registry_new = MagicMock(name="registry_new")
+            registry_cls.side_effect = [registry_old, registry_new]
+            build_map.side_effect = lambda cfg: _build_category_timeout_map(cfg)
+
+            config_old = SimpleNamespace(
+                agent_data_tool_timeout_s=10.0,
+                agent_search_tool_timeout_s=0.0,
+                agent_analysis_tool_timeout_s=0.0,
+                agent_action_tool_timeout_s=0.0,
+            )
+            factory.get_tool_registry(config_old)
+            assert factory._TOOL_REGISTRY is registry_old
+
+            # Simulate the worst case rather than relying on the allocator:
+            # a new config whose id() collides with the collected instance.
+            stale_id = id(config_old)
+            del config_old
+            gc.collect()
+
+            config_new = SimpleNamespace(
+                agent_data_tool_timeout_s=45.0,
+                agent_search_tool_timeout_s=0.0,
+                agent_analysis_tool_timeout_s=0.0,
+                agent_action_tool_timeout_s=0.0,
+            )
+            # Force a deterministic id() collision so this doubles as a real
+            # regression guard: a future implementation that re-keys the cache
+            # on ``id(config)`` would read the new config as "unchanged" and
+            # wrongly reuse ``registry_old``.  Patching ``builtins.id`` (not
+            # ``factory.id``) is required because ``get_tool_registry`` uses the
+            # builtin directly.
+            with patch("builtins.id", return_value=stale_id):
+                rebuilt = factory.get_tool_registry(config_new)
+
+            # Value-keyed cache still notices the change.
+            assert rebuilt is registry_new
+            assert registry_cls.call_args_list[-1].kwargs["category_timeout_map"] == {
+                "data": 45.0,
+                "market": 45.0,
+            }
+
+    def test_get_tool_registry_tolerates_partial_config_objects(self):
+        """Callers hand ``get_tool_registry`` whatever config they hold, which
+        in tests is routinely a ``MagicMock`` or a stub missing the timeout
+        attributes.  Neither may explode: ``MagicMock() > 0`` raises
+        ``TypeError`` and a bare stub raises ``AttributeError``, so the
+        resolver coerces both to "no category limit".
+        """
+
+        class _StubConfig:
+            """No AGENT_*_TOOL_TIMEOUT_S attributes at all."""
+
+        assert _build_category_timeout_map(MagicMock()) == {}
+        assert _build_category_timeout_map(_StubConfig()) == {}
+
+        # Garbage values degrade to "no limit" rather than propagating.
+        noisy = SimpleNamespace(
+            agent_data_tool_timeout_s="not-a-number",
+            agent_search_tool_timeout_s=None,
+            agent_analysis_tool_timeout_s=7.5,
+            agent_action_tool_timeout_s=-3.0,
+        )
+        assert _build_category_timeout_map(noisy) == {"analysis": 7.5}
 
     def test_reload_runtime_singletons_drops_registry(self):
         """``SystemConfigService._reload_runtime_singletons`` must include
@@ -465,7 +566,7 @@ class TestToolRegistryCacheInvalidation:
             #    the cache (real call, not mocked, so we exercise the wiring).
             system_config_service.SystemConfigService._reload_runtime_singletons()
             assert factory._TOOL_REGISTRY is None
-            assert factory._CACHED_CONFIG_ID is None
+            assert factory._CACHED_TIMEOUT_MAP is None
 
             # 3) Next access, with the new config, must rebuild and observe
             #    the new timeout.
