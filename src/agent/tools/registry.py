@@ -11,6 +11,7 @@ Provides:
 import json
 import inspect
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -347,14 +348,29 @@ def tool(
         if params is None:
             params = _infer_parameters(func)
 
+        # Single source of truth for per-tool timeout is
+        # ``ToolDefinition.timeout_seconds`` (the field ``runner`` actually
+        # reads).  If the caller supplied a ``timeout_seconds`` via the policy
+        # but omitted the explicit ``@tool(timeout_seconds=...)`` argument, fold
+        # the policy value in here so the two never diverge.
+        effective_timeout = timeout_seconds
+        resolved_policy = policy or ToolPolicy.unknown()
+        if effective_timeout is None and getattr(resolved_policy, "timeout_seconds", None) is not None:
+            effective_timeout = resolved_policy.timeout_seconds
+            logger.debug(
+                "Tool '%s': using ToolPolicy.timeout_seconds=%s as the effective per-tool timeout",
+                name,
+                effective_timeout,
+            )
+
         tool_def = ToolDefinition(
             name=name,
             description=description,
             parameters=params,
             handler=func,
             category=category,
-            policy=policy or ToolPolicy.unknown(),
-            timeout_seconds=timeout_seconds,
+            policy=resolved_policy,
+            timeout_seconds=effective_timeout,
         )
 
         target_registry = registry or get_default_registry()
@@ -441,7 +457,10 @@ def _resolve_tool_timeout(*candidates: Optional[float]) -> Optional[float]:
             value = float(value)
         except (TypeError, ValueError):
             continue
-        if value <= 0:
+        # ``inf``/``nan`` are not valid timeouts: an ``inf`` would later raise
+        # ``OverflowError`` at ``future.result(timeout=inf)`` and ``nan`` yields
+        # undefined ordering.  Treat them as "no limit at this level".
+        if not math.isfinite(value) or value <= 0:
             continue
         if effective is None or value < effective:
             effective = value

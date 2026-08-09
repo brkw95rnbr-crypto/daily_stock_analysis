@@ -26,6 +26,8 @@ Usage::
 
 import copy
 import logging
+import math
+import threading
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -55,6 +57,20 @@ _SENTINEL = object()
 # Track which custom_dir the prototype was built with so we can invalidate
 # the cache if AGENT_SKILL_DIR changes at runtime (e.g. via config reload).
 _SKILL_MANAGER_CUSTOM_DIR: object = _SENTINEL
+
+# Guards the module-level ToolRegistry cache against concurrent rebuild/reset.
+# ``get_tool_registry`` builds the registry *outside* this lock (see below) and
+# only takes it to atomically assign the shared ``_TOOL_REGISTRY`` /
+# ``_CACHED_TIMEOUT_MAP`` pair, so two requests with different ``Config``
+# objects can never observe a registry built for the other's timeouts.
+_tool_registry_lock = threading.Lock()
+
+# Safety ceiling for any single per-category timeout value sourced from
+# ``AGENT_*_TOOL_TIMEOUT_S``.  ``inf``/``nan``/negative already degrade to
+# "no limit"; this clips absurd-but-finite values so they can never reach
+# ``future.result(timeout=...)`` and stall a request.  The global
+# ``tool_call_timeout_seconds`` budget is *not* subject to this clip.
+_MAX_TOOL_TIMEOUT_S = 3600.0
 
 
 @dataclass
@@ -203,10 +219,36 @@ def _coerce_config_timeout(config, field_name: str) -> float:
         # ``True`` would coerce to a nonsensical 1-second ceiling.
         return 0.0
     if isinstance(raw_value, (int, float)):
-        return float(raw_value)
+        value = float(raw_value)
+        if not math.isfinite(value):
+            # ``inf``/``nan`` are not valid ceilings; an ``inf`` would later
+            # raise ``OverflowError`` at ``future.result(timeout=inf)``.
+            logger.warning(
+                "[AgentFactory] Non-finite value for %s: %r, treating as no category limit",
+                field_name,
+                raw_value,
+            )
+            return 0.0
+        if value < 0:
+            logger.warning(
+                "[AgentFactory] Negative value for %s: %r, treating as no category limit",
+                field_name,
+                raw_value,
+            )
+            return 0.0
+        if value == 0.0:
+            # Explicitly disabled (the default) — silent, not a warning.
+            return 0.0
+        if value > _MAX_TOOL_TIMEOUT_S:
+            logger.warning(
+                "[AgentFactory] Clamping %s=%r to safety ceiling %ss",
+                field_name, value, _MAX_TOOL_TIMEOUT_S,
+            )
+            return float(_MAX_TOOL_TIMEOUT_S)
+        return value
     if isinstance(raw_value, str):
         try:
-            return float(raw_value.strip())
+            value = float(raw_value.strip())
         except ValueError:
             logger.warning(
                 "[AgentFactory] Invalid value for %s: %r, treating as no category limit",
@@ -214,6 +256,25 @@ def _coerce_config_timeout(config, field_name: str) -> float:
                 raw_value,
             )
             return 0.0
+        if not math.isfinite(value):
+            logger.warning(
+                "[AgentFactory] Non-finite value for %s: %r, treating as no category limit",
+                field_name,
+                raw_value,
+            )
+            return 0.0
+        if value < 0:
+            logger.warning(
+                "[AgentFactory] Negative value for %s: %r, treating as no category limit",
+                field_name,
+                raw_value,
+            )
+            return 0.0
+        if value == 0.0:
+            return 0.0
+        if value > _MAX_TOOL_TIMEOUT_S:
+            return float(_MAX_TOOL_TIMEOUT_S)
+        return value
 
     # Mocks / arbitrary objects: never let them shape real timeout behaviour.
     logger.debug(
@@ -256,12 +317,44 @@ def reset_tool_registry() -> None:
     ``AGENT_*_TOOL_TIMEOUT_S`` overrides actually take effect on subsequent
     :func:`build_agent_executor` / :func:`build_agent_chat_executor` calls,
     instead of being silently shadowed by the registry built at first import.
+
+    Guarded by ``_tool_registry_lock`` so a concurrent :func:`get_tool_registry`
+    cannot read a half-reset cache (``None`` registry with a stale map, or vice
+    versa).
     """
     global _TOOL_REGISTRY, _CACHED_TIMEOUT_MAP
-    if _TOOL_REGISTRY is not None:
-        logger.info("[AgentFactory] ToolRegistry cache cleared; will rebuild on next access")
-    _TOOL_REGISTRY = None
-    _CACHED_TIMEOUT_MAP = None
+    with _tool_registry_lock:
+        if _TOOL_REGISTRY is not None:
+            logger.info("[AgentFactory] ToolRegistry cache cleared; will rebuild on next access")
+        _TOOL_REGISTRY = None
+        _CACHED_TIMEOUT_MAP = None
+
+
+def _build_tool_registry(category_timeout_map):
+    """Construct and populate a :class:`ToolRegistry` from the tool modules.
+
+    Extracted from :func:`get_tool_registry` so the (potentially heavy) tool
+    module imports and registrations happen *outside* the cache lock — holding
+    the lock during imports would serialise startup and risk a deadlock if any
+    imported module ever imported this module back.
+    """
+    from src.agent.tools.registry import ToolRegistry
+    from src.agent.tools.data_tools import ALL_DATA_TOOLS
+    from src.agent.tools.analysis_tools import ALL_ANALYSIS_TOOLS
+    from src.agent.tools.search_tools import ALL_SEARCH_TOOLS
+    from src.agent.tools.market_tools import ALL_MARKET_TOOLS
+    from src.agent.tools.backtest_tools import ALL_BACKTEST_TOOLS
+
+    registry = ToolRegistry(category_timeout_map=category_timeout_map or None)
+    for tool_fn in (
+        ALL_DATA_TOOLS
+        + ALL_ANALYSIS_TOOLS
+        + ALL_SEARCH_TOOLS
+        + ALL_MARKET_TOOLS
+        + ALL_BACKTEST_TOOLS
+    ):
+        registry.register(tool_fn)
+    return registry
 
 
 def get_tool_registry(config=None):
@@ -282,6 +375,14 @@ def get_tool_registry(config=None):
     When ``config`` is ``None`` the function falls back to ``get_config()``,
     preserving the legacy contract for callers that do not yet know about
     config reload.
+
+    Thread-safety: the cache read and the registry build both run without the
+    lock; only the final assignment of the shared ``_TOOL_REGISTRY`` /
+    ``_CACHED_TIMEOUT_MAP`` pair is serialised (double-checked locking), so two
+    requests with different ``Config`` objects can never observe a registry built
+    for the other's timeouts.  On a (re)build the function returns the registry it
+    just constructed for the caller's timeout map, so a concurrent rebuild cannot
+    leak a mismatched registry into this call's result.
     """
     global _TOOL_REGISTRY, _CACHED_TIMEOUT_MAP
 
@@ -291,29 +392,20 @@ def get_tool_registry(config=None):
         config = get_config()
 
     category_timeout_map = _build_category_timeout_map(config)
+    # Fast path (no lock) for the common cache hit.
     if _TOOL_REGISTRY is not None and _CACHED_TIMEOUT_MAP == category_timeout_map:
         return _TOOL_REGISTRY
 
-    from src.agent.tools.registry import ToolRegistry
-    from src.agent.tools.data_tools import ALL_DATA_TOOLS
-    from src.agent.tools.analysis_tools import ALL_ANALYSIS_TOOLS
-    from src.agent.tools.search_tools import ALL_SEARCH_TOOLS
-    from src.agent.tools.market_tools import ALL_MARKET_TOOLS
-    from src.agent.tools.backtest_tools import ALL_BACKTEST_TOOLS
-
-    registry = ToolRegistry(category_timeout_map=category_timeout_map or None)
-    for tool_fn in (
-        ALL_DATA_TOOLS
-        + ALL_ANALYSIS_TOOLS
-        + ALL_SEARCH_TOOLS
-        + ALL_MARKET_TOOLS
-        + ALL_BACKTEST_TOOLS
-    ):
-        registry.register(tool_fn)
-
-    invalidated = _TOOL_REGISTRY is not None
-    _TOOL_REGISTRY = registry
-    _CACHED_TIMEOUT_MAP = category_timeout_map
+    # Build *outside* the lock (see ``_build_tool_registry`` rationale above).
+    registry = _build_tool_registry(category_timeout_map)
+    with _tool_registry_lock:
+        # Re-check under the lock: another thread may have installed an
+        # equivalent registry while we were importing the tool modules.
+        if _TOOL_REGISTRY is not None and _CACHED_TIMEOUT_MAP == category_timeout_map:
+            return _TOOL_REGISTRY
+        invalidated = _TOOL_REGISTRY is not None
+        _TOOL_REGISTRY = registry
+        _CACHED_TIMEOUT_MAP = category_timeout_map
     if invalidated:
         logger.info(
             "[AgentFactory] ToolRegistry rebuilt for new category timeouts: %s",
@@ -325,7 +417,13 @@ def get_tool_registry(config=None):
             len(registry._tools) if hasattr(registry, "_tools") else -1,
             category_timeout_map or "none (global budget only)",
         )
-    return _TOOL_REGISTRY
+    # Return the registry built for *this* call's timeout map (not the shared
+    # ``_TOOL_REGISTRY`` global).  Under a concurrent rebuild for a different
+    # ``Config``/timeout map, this guarantees the caller gets the registry that
+    # matches the timeouts it requested, instead of a registry built for another
+    # request.  The global is still assigned above so equivalent subsequent calls
+    # hit the cache fast path.
+    return registry
 
 
 def get_skill_manager(config=None):

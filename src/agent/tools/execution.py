@@ -21,6 +21,36 @@ from src.agent.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Cooperative cancellation signal (best-effort timeouts, Issue #1890 / review)
+# ---------------------------------------------------------------------------
+# Python cannot forcibly stop an already-started tool thread, so when a tool
+# times out its handler may keep running in the background.  To give long or
+# side-effecting handlers a way to honour the timeout, the runner arms a
+# per-call ``threading.Event`` on timeout and publishes it through this
+# contextvar for the duration of the call.  Handlers that perform long loops or
+# irreversible side effects MAY poll ``is_tool_cancellation_requested`` and abort
+# early.  The signal is strictly opt-in: handlers that never call it are
+# completely unaffected, and the runner only sets the event after a timeout has
+# already fired — never during normal completion.  This is the "in-handler
+# cooperative cancel" mitigation requested in review, layered on top of the
+# non-retriable cache (which blocks the LLM from re-launching the same call).
+TOOL_CANCEL_EVENT: "contextvars.ContextVar[Optional[threading.Event]]" = contextvars.ContextVar(
+    "tool_cancel_event", default=None
+)
+
+
+def is_tool_cancellation_requested() -> bool:
+    """Return True when the current tool call has been asked to cancel.
+
+    Tool handlers may call this cheaply inside long loops or before performing
+    an irreversible side effect, to honour a best-effort timeout.  Returns False
+    unless the runner has armed the cancellation event for the running call.
+    """
+    event = TOOL_CANCEL_EVENT.get()
+    return event is not None and event.is_set()
+
+
 _SUMMARY_LIMIT = 500
 _TOKEN_PATTERN = re.compile(
     r"(?i)\b(?:sk|pk|ghp|gho|github_pat|xox[baprs]?|bearer)[-_a-z0-9]{12,}\b"

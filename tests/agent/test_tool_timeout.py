@@ -16,6 +16,7 @@ of relying on the decorator's registry fallback.
 import gc
 import json
 import sys
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -605,3 +606,287 @@ class TestToolRegistryCacheInvalidation:
                 "data": 99.0,
                 "market": 99.0,
             }
+
+
+# ---------------------------------------------------------------------------
+# 8. Maintainer review blockers (first-wins precedence, non-retriable timeouts,
+#    finite validation, cache thread-safety)
+# ---------------------------------------------------------------------------
+class TestFirstWinsTimeoutPrecedence:
+    """Blocker: an *explicit per-tool* timeout must outrank a smaller category
+    default.  The previous ``min()`` across all levels let a category default
+    silently override an explicit per-tool declaration.
+    """
+
+    def test_explicit_per_tool_beats_smaller_category(self):
+        reg = ToolRegistry(category_timeout_map={"data": 10.0})
+        _register(reg, "t", lambda: None, category="data", timeout_seconds=30.0)
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 60.0) == 30.0
+
+    def test_explicit_per_tool_beats_larger_category(self):
+        reg = ToolRegistry(category_timeout_map={"data": 50.0})
+        _register(reg, "t", lambda: None, category="data", timeout_seconds=20.0)
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 120.0) == 20.0
+
+    def test_global_budget_is_outer_cap_only(self):
+        reg = ToolRegistry(category_timeout_map={"data": 10.0})
+        _register(reg, "t", lambda: None, category="data", timeout_seconds=30.0)
+        # base 30 capped to the 15s global budget.
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 15.0) == 15.0
+        # global disabled -> the explicit per-tool 30s stands.
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, None) == 30.0
+
+
+class TestTimeoutResultNonRetriable:
+    """Blocker: a timed-out call must be marked ``retriable: False`` *and*
+    recorded in ``non_retriable_tool_results`` so an LLM retry of the same call
+    reuses the cached failure instead of spinning up a second (side-effecting)
+    execution.  Python cannot forcibly cancel an already-started tool thread, so
+    this is the best-effort guard against duplicate work.
+    """
+
+    def test_timeout_result_is_marked_non_retriable(self):
+        reg = ToolRegistry(category_timeout_map={"data": 0.2})
+
+        def slow():
+            time.sleep(1.0)
+            return {"ok": True}
+
+        _register(reg, "slow", slow, category="data")
+        results = _execute_tools(
+            [_make_tool_call("slow")], reg, step=1,
+            progress_callback=None, tool_calls_log=[],
+            tool_wait_timeout_seconds=None,
+        )
+        parsed = json.loads(results[0]["result_str"])
+        assert parsed.get("timeout") is True
+        assert parsed.get("retriable") is False
+
+    def test_timed_out_tool_not_re_executed_on_retry(self):
+        reg = ToolRegistry(category_timeout_map={"data": 0.2})
+        calls = {"n": 0}
+
+        def slow():
+            calls["n"] += 1
+            time.sleep(1.0)
+            return {"ok": True}
+
+        _register(reg, "slow", slow, category="data")
+        shared_non_retriable = {}
+
+        # First call times out and is recorded as non-retriable.
+        res1 = _execute_tools(
+            [_make_tool_call("slow", tc_id="c1")], reg, step=1,
+            progress_callback=None, tool_calls_log=[],
+            tool_wait_timeout_seconds=None,
+            non_retriable_tool_results=shared_non_retriable,
+        )
+        assert json.loads(res1[0]["result_str"]).get("timeout") is True
+        assert "slow" in shared_non_retriable  # keyed by name+args
+
+        first_calls = calls["n"]
+        # Identical retry: must NOT spin up a second execution.
+        res2 = _execute_tools(
+            [_make_tool_call("slow", tc_id="c1")], reg, step=2,
+            progress_callback=None, tool_calls_log=[],
+            tool_wait_timeout_seconds=None,
+            non_retriable_tool_results=shared_non_retriable,
+        )
+        assert json.loads(res2[0]["result_str"]).get("timeout") is True
+        assert calls["n"] == first_calls  # handler never ran again
+
+
+class TestTimeoutFiniteValidation:
+    """Blocker: ``inf``/``nan``/negative ``AGENT_*_TOOL_TIMEOUT_S`` must degrade
+    to "no limit" rather than raising ``OverflowError`` at
+    ``future.result(timeout=inf)``.
+    """
+
+    def test_config_inf_degrades_to_no_limit(self):
+        from src.agent.factory import _coerce_config_timeout
+
+        cfg = SimpleNamespace(agent_data_tool_timeout_s=float("inf"))
+        assert _coerce_config_timeout(cfg, "agent_data_tool_timeout_s") == 0.0
+
+    def test_config_nan_degrades_to_no_limit(self):
+        from src.agent.factory import _coerce_config_timeout
+
+        cfg = SimpleNamespace(agent_data_tool_timeout_s=float("nan"))
+        assert _coerce_config_timeout(cfg, "agent_data_tool_timeout_s") == 0.0
+
+    def test_config_excessive_value_is_clamped(self):
+        from src.agent.factory import _coerce_config_timeout, _MAX_TOOL_TIMEOUT_S
+
+        cfg = SimpleNamespace(agent_data_tool_timeout_s=999999.0)
+        assert _coerce_config_timeout(cfg, "agent_data_tool_timeout_s") == _MAX_TOOL_TIMEOUT_S
+
+    def test_per_tool_inf_is_not_a_valid_timeout(self):
+        reg = ToolRegistry(category_timeout_map={})
+        _register(reg, "t", lambda: None, category="data", timeout_seconds=float("inf"))
+        # inf must not survive into the resolved timeout.
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, None) is None
+
+    def test_resolve_tool_timeout_ignores_inf_and_nan(self):
+        # inf/nan are skipped; the next positive candidate wins.
+        assert _resolve_tool_timeout(float("inf"), 12.0) == 12.0
+        assert _resolve_tool_timeout(float("nan"), 7.0, 0) == 7.0
+
+
+class TestToolRegistryCacheThreadSafety:
+    """Blocker: ``get_tool_registry`` / ``reset_tool_registry`` must be safe
+    under concurrent requests with different ``Config`` objects — no partial
+    assignment of the shared ``_TOOL_REGISTRY`` / ``_CACHED_TIMEOUT_MAP`` pair.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_factory_module_state(self):
+        from src.agent import factory
+
+        saved_registry = factory._TOOL_REGISTRY
+        saved_timeout_map = factory._CACHED_TIMEOUT_MAP
+        factory.reset_tool_registry()
+        try:
+            yield
+        finally:
+            factory._TOOL_REGISTRY = saved_registry
+            factory._CACHED_TIMEOUT_MAP = saved_timeout_map
+
+    def test_lock_is_present(self):
+        from src.agent import factory
+
+        assert isinstance(factory._tool_registry_lock, threading.Lock)
+
+    def test_concurrent_builds_do_not_raise(self):
+        from src.agent import factory
+        import threading
+
+        config_a = SimpleNamespace(
+            agent_data_tool_timeout_s=10.0,
+            agent_search_tool_timeout_s=0.0,
+            agent_analysis_tool_timeout_s=0.0,
+            agent_action_tool_timeout_s=0.0,
+        )
+        config_b = SimpleNamespace(
+            agent_data_tool_timeout_s=25.0,
+            agent_search_tool_timeout_s=0.0,
+            agent_analysis_tool_timeout_s=0.0,
+            agent_action_tool_timeout_s=0.0,
+        )
+
+        errors = []
+
+        def worker(idx):
+            try:
+                cfg = config_a if idx % 2 == 0 else config_b
+                for _ in range(25):
+                    reg = factory.get_tool_registry(cfg)
+                    assert reg is not None
+            except Exception as exc:  # pragma: no cover
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"concurrent get_tool_registry raised: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# 9. Maintainer review follow-up: cooperative cancel + local-registry return
+# ---------------------------------------------------------------------------
+class TestTimeoutCooperativeCancel:
+    """Blocker: a tool handler may keep running after its timeout fires (Python
+    cannot forcibly stop an already-started thread).  The runner must (a) mark
+    the result non-retriable (covered by ``TestTimeoutResultNonRetriable``) and
+    (b) arm a cooperative-cancel signal that opt-in handlers can poll via
+    ``is_tool_cancellation_requested`` so they can abort early.
+    """
+
+    def test_helper_defaults_false(self):
+        from src.agent.tools.execution import is_tool_cancellation_requested
+
+        assert is_tool_cancellation_requested() is False
+
+    def test_helper_true_when_armed(self):
+        from src.agent.tools.execution import (
+            TOOL_CANCEL_EVENT,
+            is_tool_cancellation_requested,
+        )
+
+        import threading
+
+        event = threading.Event()
+        token = TOOL_CANCEL_EVENT.set(event)
+        try:
+            assert is_tool_cancellation_requested() is False
+            event.set()
+            assert is_tool_cancellation_requested() is True
+        finally:
+            TOOL_CANCEL_EVENT.reset(token)
+
+    def test_runner_arms_cancel_on_timeout(self):
+        from src.agent.tools.execution import is_tool_cancellation_requested
+
+        import time as _time
+
+        captured = {"requested": None}
+
+        def slow_handler(**kwargs):
+            # Poll cancellation the way an opt-in handler would.
+            deadline = _time.time() + 3.0
+            while _time.time() < deadline:
+                if is_tool_cancellation_requested():
+                    captured["requested"] = True
+                    return {"ok": True}
+                _time.sleep(0.02)
+            captured["requested"] = is_tool_cancellation_requested()
+            return {"ok": True}
+
+        reg = ToolRegistry()
+        reg.register(ToolDefinition(
+            name="slow_tool", description="s", parameters=[],
+            handler=slow_handler, category="data",
+        ))
+        tool_calls = [SimpleNamespace(name="slow_tool", arguments={})]
+        results = _execute_tools(
+            tool_calls, reg, 1, None, [],
+            non_retriable_tool_results={},
+            tool_wait_timeout_seconds=0.1,
+        )
+        # Give the still-running background handler time to observe the armed signal.
+        _time.sleep(0.8)
+        assert len(results) == 1
+        parsed = json.loads(results[0]["result_str"])
+        assert parsed.get("timeout") is True
+        assert parsed.get("retriable") is False
+        assert captured["requested"] is True
+
+
+class TestGetToolRegistryReturnsLocalRegistry:
+    """Blocker: ``get_tool_registry`` must return the registry it just built for
+    the caller's timeout map (not the shared global), so a concurrent rebuild
+    for a different ``Config`` cannot leak a mismatched registry into this call.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self):
+        from src.agent import factory
+
+        saved_registry = factory._TOOL_REGISTRY
+        saved_timeout_map = factory._CACHED_TIMEOUT_MAP
+        factory.reset_tool_registry()
+        try:
+            yield
+        finally:
+            factory._TOOL_REGISTRY = saved_registry
+            factory._CACHED_TIMEOUT_MAP = saved_timeout_map
+
+    def test_returns_locally_built_registry(self, monkeypatch):
+        from src.agent import factory
+
+        sentinel = ToolRegistry({"data": 11})
+        monkeypatch.setattr(factory, "_build_tool_registry", lambda m: sentinel)
+        cfg = SimpleNamespace(agent_data_tool_timeout_s=11)
+        assert factory.get_tool_registry(cfg) is sentinel

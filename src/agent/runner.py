@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
+import threading
 import contextvars
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass, field
@@ -28,8 +30,9 @@ from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.dashboard_payload import sanitize_agent_dashboard_payload
 from src.agent.protocols import StageFailureReason
 from src.agent.stream_events import stream_event
-from src.agent.tools.registry import ToolRegistry, _resolve_tool_timeout
+from src.agent.tools.registry import ToolRegistry
 from src.agent.tools.execution import (
+    TOOL_CANCEL_EVENT,
     _build_tool_cache_key,
     _guard_tool_stock_scope,
     _is_non_retriable_tool_result,
@@ -601,29 +604,90 @@ def run_agent_loop(
 # Internal tool execution
 # ============================================================
 
+def _coerce_positive_timeout(value) -> Optional[float]:
+    """Coerce a timeout candidate to a positive finite float, else ``None``.
+
+    ``None`` / non-numeric / non-positive / ``inf`` / ``nan`` all map to
+    ``None`` ("no limit at this level").  Rejecting non-finite values prevents
+    an ``OverflowError`` from ``future.result(timeout=inf)`` and avoids the
+    undefined ordering a ``nan`` would produce.
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v) or v <= 0:
+        return None
+    return v
+
+
+def _build_timeout_result_payload(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    timeout_s: float,
+    non_retriable_tool_results: Optional[Dict[str, str]],
+) -> str:
+    """Build the timeout-shaped result string and record it as non-retriable.
+
+    A timed-out call is marked ``"retriable": False`` and inserted into
+    ``non_retriable_tool_results`` so the LLM's retry of the *same* call reuses
+    the cached failure instead of spinning up a second (possibly side-effecting)
+    execution — a best-effort guard against duplicate work, since Python cannot
+    forcibly cancel an already-started tool thread.
+    """
+    label = f"{timeout_s:.2f}s"
+    result_str = json.dumps({
+        "error": f"Tool execution timed out after {label}",
+        "timeout": True,
+        "retriable": False,
+    })
+    if non_retriable_tool_results is not None:
+        non_retriable_tool_results[_build_tool_cache_key(tool_name, arguments)] = result_str
+    return result_str
+
+
 def _resolve_per_tool_timeout(
     tool_call,
     tool_registry: Optional[ToolRegistry],
     global_timeout: Optional[float],
 ) -> Optional[float]:
-    """Resolve the effective timeout for a single tool call.
+    """Resolve the effective timeout for a single tool call (Issue #1890).
 
-    Effective timeout is the *minimum* across candidates (smallest positive
-    wins; ``None``/``0`` ignored): per-tool declaration, category default, and
-    the caller's global timeout (which already encodes the remaining
-    wall-clock budget).  Returns ``None`` when nothing sets a limit, so the
-    caller's global budget still governs.
+    Precedence is *first-wins within the registry fallback*, then the global
+    ``tool_call_timeout_seconds`` / remaining wall-clock budget acts as an
+    unbreakable outer cap:
+
+        1. explicit per-tool timeout (``ToolDefinition.timeout_seconds``)
+        2. category default (``AGENT_*_TOOL_TIMEOUT_S``)
+        3. none (no per-tool limit)
+
+    The explicit per-tool value therefore has the **highest** precedence and is
+    never lowered by a smaller category default — the previous ``min()`` across
+    all levels silently let a category default override an explicit per-tool
+    declaration.  The global budget still caps the result, so a long per-tool
+    timeout can never exceed the caller's overall budget.
     """
+    global_budget = _coerce_positive_timeout(global_timeout)
     if tool_registry is None:
-        return _resolve_tool_timeout(global_timeout)
+        return global_budget
     tool_def = tool_registry.get(tool_call.name)
     if tool_def is None:
-        return _resolve_tool_timeout(global_timeout)
-    return _resolve_tool_timeout(
-        getattr(tool_def, "timeout_seconds", None),
-        tool_registry.category_default_timeout(tool_def.category),
-        global_timeout,
-    )
+        return global_budget
+
+    per_tool = _coerce_positive_timeout(getattr(tool_def, "timeout_seconds", None))
+    category = _coerce_positive_timeout(tool_registry.category_default_timeout(tool_def.category))
+
+    # First-wins registry fallback: explicit per-tool > category default.
+    base = per_tool if per_tool is not None else category
+
+    if base is None:
+        # No per-tool/category limit; the global budget governs.
+        return global_budget
+    if global_budget is not None:
+        return min(base, global_budget)
+    return base
 
 
 def _execute_tools(
@@ -649,29 +713,33 @@ def _execute_tools(
             non_retriable_tool_results=non_retriable_tool_results,
         )
 
-    def _exec_single_with_timeout(tc_item, per_tool_timeout):
+    def _exec_single_with_timeout(tc_item, per_tool_timeout, cancel_event=None):
         """Run a single tool call with an optional per-tool timeout.
 
         Returns ``(result_6tuple, timed_out)``.  When the per-tool timeout
         fires, a timeout-shaped 6-tuple is returned and ``timed_out`` is
         ``True`` so the outer batch loop treats it as a completed result
-        rather than raising ``FuturesTimeoutError``.
+        rather than raising ``FuturesTimeoutError``.  A ``cancel_event``
+        (created here when not supplied) is armed on timeout so a still-running
+        handler can cooperate via ``is_tool_cancellation_requested()``.
         """
         if not per_tool_timeout or per_tool_timeout <= 0:
             return _exec_single(tc_item), False
+        if cancel_event is None:
+            cancel_event = threading.Event()
         pool = ThreadPoolExecutor(max_workers=1)
         ctx = contextvars.copy_context()
+        ctx.run(TOOL_CANCEL_EVENT.set, cancel_event)
         try:
             future = pool.submit(ctx.run, _exec_single, tc_item)
             try:
                 return future.result(timeout=per_tool_timeout), False
             except FuturesTimeoutError:
                 future.cancel()
-                timeout_label = f"{per_tool_timeout:.2f}s"
-                result_str = json.dumps({
-                    "error": f"Tool execution timed out after {timeout_label}",
-                    "timeout": True,
-                })
+                cancel_event.set()
+                result_str = _build_timeout_result_payload(
+                    tc_item.name, tc_item.arguments, per_tool_timeout, non_retriable_tool_results,
+                )
                 return (tc_item, result_str, False, round(per_tool_timeout, 2), False, None), True
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
@@ -690,6 +758,8 @@ def _execute_tools(
         if per_tool_timeout and per_tool_timeout > 0:
             pool = ThreadPoolExecutor(max_workers=1)
             ctx = contextvars.copy_context()
+            cancel_event = threading.Event()
+            ctx.run(TOOL_CANCEL_EVENT.set, cancel_event)
             try:
                 future = pool.submit(ctx.run, _exec_single, tc)
                 try:
@@ -697,12 +767,11 @@ def _execute_tools(
                 except FuturesTimeoutError:
                     timeout_triggered = True
                     future.cancel()
-                    timeout_label = f"{per_tool_timeout:.2f}s"
-                    logger.warning("Tool '%s' timed out after %s at step %d", tc.name, timeout_label, step)
-                    result_str = json.dumps({
-                        "error": f"Tool execution timed out after {timeout_label}",
-                        "timeout": True,
-                    })
+                    cancel_event.set()
+                    logger.warning("Tool '%s' timed out after %.2fs at step %d", tc.name, per_tool_timeout, step)
+                    result_str = _build_timeout_result_payload(
+                        tc.name, tc.arguments, per_tool_timeout, non_retriable_tool_results,
+                    )
                     success = False
                     dur = round(per_tool_timeout, 2)
                     cached = False
@@ -740,15 +809,21 @@ def _execute_tools(
 
         pool = ThreadPoolExecutor(max_workers=min(len(tool_calls), 5))
         timeout_triggered = False
+        # Keyed by Future (not by tool name) so that two parallel calls to the
+        # same tool each get their own cancel event — a name-keyed dict would let
+        # one call's event shadow the other's on a batch timeout.
+        future_cancel: Dict = {}
         try:
-            futures = {
-                pool.submit(
+            futures = {}
+            for tc in tool_calls:
+                per_tool_timeout = _resolve_per_tool_timeout(tc, tool_registry, tool_wait_timeout_seconds)
+                cancel_event = threading.Event()
+                fut = pool.submit(
                     contextvars.copy_context().run,
-                    _exec_single_with_timeout, tc,
-                    _resolve_per_tool_timeout(tc, tool_registry, tool_wait_timeout_seconds),
-                ): tc
-                for tc in tool_calls
-            }
+                    _exec_single_with_timeout, tc, per_tool_timeout, cancel_event,
+                )
+                future_cancel[fut] = cancel_event
+                futures[fut] = tc
             pending = set(futures)
             for future in as_completed(
                 futures,
@@ -785,10 +860,11 @@ def _execute_tools(
             for future, tc_item in futures.items():
                 if future in pending:
                     future.cancel()
-                    result_str = json.dumps({
-                        "error": f"Tool execution timed out after {timeout_label}",
-                        "timeout": True,
-                    })
+                    future_cancel[future].set()
+                    result_str = _build_timeout_result_payload(
+                        tc_item.name, tc_item.arguments,
+                        tool_wait_timeout_seconds, non_retriable_tool_results,
+                    )
                     if progress_callback:
                         progress_callback(stream_event(
                             "tool_done",
