@@ -2,7 +2,7 @@
 """Unit tests for agent tool timeout resolution (Issue #1890).
 
 Covers:
-- the pure ``_resolve_tool_timeout`` minimum resolver
+- the pure ``_resolve_tool_timeout`` candidate resolver (smallest positive wins)
 - registry / policy / definition timeout fields
 - ``_resolve_per_tool_timeout`` wiring
 - end-to-end ``_execute_tools`` per-tool timeout + fail-open behaviour
@@ -37,6 +37,7 @@ from src.agent.tools.registry import (
     tool,
 )
 from src.agent.runner import _execute_tools, _resolve_per_tool_timeout
+from src.agent.tools.execution import _build_tool_cache_key
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +683,7 @@ class TestTimeoutResultNonRetriable:
             non_retriable_tool_results=shared_non_retriable,
         )
         assert json.loads(res1[0]["result_str"]).get("timeout") is True
-        assert "slow" in shared_non_retriable  # keyed by name+args
+        assert _build_tool_cache_key("slow", {}) in shared_non_retriable  # keyed by name+args
 
         first_calls = calls["n"]
         # Identical retry: must NOT spin up a second execution.
@@ -754,7 +755,7 @@ class TestToolRegistryCacheThreadSafety:
     def test_lock_is_present(self):
         from src.agent import factory
 
-        assert isinstance(factory._tool_registry_lock, threading.Lock)
+        assert isinstance(factory._tool_registry_lock, type(threading.Lock()))
 
     def test_concurrent_builds_do_not_raise(self):
         from src.agent import factory

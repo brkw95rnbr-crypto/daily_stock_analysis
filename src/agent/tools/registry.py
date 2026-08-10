@@ -448,6 +448,15 @@ def _resolve_tool_timeout(*candidates: Optional[float]) -> Optional[float]:
 
     The result is the *minimum* across all candidates so a per-tool or
     category timeout can never exceed the caller's remaining budget.
+
+    .. note::
+       This is a generic "smallest positive candidate" helper and is **not**
+       the runtime precedence path.  Per-call timeout resolution for the agent
+       loop lives in :func:`src.agent.runner._resolve_per_tool_timeout`, which
+       applies *first-wins* precedence (explicit per-tool ``timeout_seconds`` >
+       category default > no limit) and only then caps the winner with the
+       global ``tool_call_timeout_seconds`` budget.  Do not use this helper to
+       reason about that contract.
     """
     effective: Optional[float] = None
     for value in candidates:
