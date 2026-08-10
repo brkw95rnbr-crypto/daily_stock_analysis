@@ -195,11 +195,17 @@ def _normalize_explicit_exchange_parts(
 
 
 def is_code_like(value: str) -> bool:
-    """Check if string looks like a stock code (5-6 digits, 1-5 letters, or prefixed code)."""
+    """Check if string looks like a stock code (4-6 digits, 1-5 letters, or prefixed code).
+
+    Bare 4-digit numeric codes are HK stocks (e.g. ``0001`` 长和 / ``0941``
+    中国移动). This mirrors ``data_provider.base._is_hk_market`` and
+    ``parse_analysis_target`` so all input boundaries treat 4-5 digit bare
+    numerics as HK, not as free text (fixes #2091 contract drift).
+    """
     text = value.strip().upper()
     if not text:
         return False
-    if text.isdigit() and len(text) in (5, 6):
+    if text.isdigit() and len(text) in (4, 5, 6):
         return True
     explicit_parts = _split_explicit_exchange(text)
     if explicit_parts is not None:
@@ -213,12 +219,16 @@ def normalize_code(raw: str) -> Optional[str]:
     """Normalize and validate a single stock code.
 
     Supports:
-    - Plain digit codes: 600519, 00700
+    - Plain digit codes: 600519, 00700, 0001 (bare 4-digit HK canonicalized
+      to the padded ``HKxxxxx`` form so persisted/driven analysis keeps the
+      HK market context)
     - Suffix format: 600519.SH, 600519.SZ, 920493.BJ, 00700.HK
     - Prefix format: SH600519, SH.600519, SZ000001, BJ920493, HK00700 (case-insensitive)
     - US ticker symbols: AAPL, TSLA
     """
     normalized, _ = _normalize_code_and_exchange(raw)
+    if normalized is not None and normalized.isdigit() and len(normalized) == 4:
+        return f"HK{normalized.zfill(5)}"
     return normalized
 
 
@@ -227,7 +237,7 @@ def _normalize_code_and_exchange(raw: str) -> tuple[Optional[str], str]:
     text = raw.strip().upper()
     if not text:
         return None, ""
-    if text.isdigit() and len(text) in (5, 6):
+    if text.isdigit() and len(text) in (4, 5, 6):
         return text, ""
     explicit_parts = _split_explicit_exchange(text)
     explicit_exchange = explicit_parts[0] if explicit_parts is not None else ""
@@ -474,12 +484,16 @@ def build_daily_code_candidates(code: Optional[str]) -> List[str]:
 
 
 def resolve_index_stock_code_for_analysis(raw: str) -> str:
-    """Resolve bare JP/KR candidates via stock index and keep suffix forms.
+    """Resolve indexed JP/KR candidates while preserving the bare-code contract.
 
-    For code-like inputs and indexed 4-digit JP bare bases:
-    - Existing index-backed entries (e.g. ``005930`` -> ``005930.KS``) are
-      preferred.
-    - Non-matching code-like inputs keep the canonicalized input.
+    Bare 4-digit numerics are an HK input contract. They are canonicalized to
+    the padded ``HKxxxxx`` form before any JP/KR index lookup, so an ambiguous
+    value such as ``7203`` cannot silently change market context. Japan and
+    Korea inputs must use their explicit Yahoo suffix (for example,
+    ``7203.T`` or ``005930.KS``).
+
+    Other code-like inputs may still resolve through the stock index (for
+    example, ``005930`` -> ``005930.KS`` when the indexed identity is unique).
 
     Non-code-like values are still canonicalized only, letting callers keep
     their own validation policy (e.g. API name resolution path).
@@ -488,7 +502,10 @@ def resolve_index_stock_code_for_analysis(raw: str) -> str:
     if not text:
         return ""
 
-    if is_code_like(text) or (text.isdigit() and len(text) == 4):
+    if text.isdigit() and len(text) == 4:
+        return f"HK{text.zfill(5)}"
+
+    if is_code_like(text):
         from src.data.stock_index_loader import resolve_index_stock_code
 
         resolved = resolve_index_stock_code(text)

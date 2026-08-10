@@ -81,6 +81,7 @@ _STOCK_CODE_RE = re.compile(
     r"|\d{6}\.(?:SH|SZ|SS|BJ)"                # exchange-suffixed A-share
     r"|\d{1,5}\.HK"                           # HK suffix format
     r"|HK\d{1,5}"                             # HK prefix format
+    r"|\d{4}"                                 # bare 4-digit HK code
     r"|\d{5}"                                 # bare 5-digit HK code
     r"|[A-Z]{1,5}(?:\.(?:US|[A-Z]))?"         # US ticker
     r")$",
@@ -107,14 +108,17 @@ def _validate_and_normalize_stock_code(code: str) -> str:
                 "message": f"'{stripped}' 不是合法的股票代码格式",
             },
         )
-    return normalize_stock_code(stripped)
+    normalized = normalize_stock_code(stripped)
+    if re.fullmatch(r"\d{4}", normalized):
+        return f"HK{normalized.zfill(5)}"
+    return normalized
 
 
 def _watchlist_match_key(code: str) -> str:
     """Return the equivalence key used for watchlist add/remove matching."""
     normalized = normalize_stock_code(code.strip())
-    if re.fullmatch(r"\d{5}", normalized):
-        return f"HK{normalized}"
+    if re.fullmatch(r"\d{4,5}", normalized):
+        return f"HK{normalized.zfill(5)}"
     return normalized.upper()
 
 
@@ -357,7 +361,14 @@ def add_to_watchlist(
         codes = _read_watchlist_codes(service)
         existing_keys = [_watchlist_match_key(c) for c in codes]
         if _watchlist_match_key(validated) not in existing_keys:
-            codes.append(request.stock_code.strip())
+            # Persist the padded HK form for bare 4-digit inputs so scheduled
+            # analysis reuses the same market identity as the API request.
+            stored_code = (
+                validated
+                if re.fullmatch(r"\d{4}", request.stock_code.strip())
+                else request.stock_code.strip()
+            )
+            codes.append(stored_code)
             _write_watchlist_codes(service, codes)
         return WatchlistResponse(stock_codes=codes, message=f"已加入 {request.stock_code.strip()}")
     except HTTPException:

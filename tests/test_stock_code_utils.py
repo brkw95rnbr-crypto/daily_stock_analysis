@@ -134,8 +134,13 @@ class TestIsCodeLike:
     def test_plain_5_digit(self):
         assert is_code_like("00700") is True
 
-    def test_4_digit_rejected(self):
-        assert is_code_like("6001") is False
+    def test_plain_4_digit_hk(self):
+        # Bare 4-digit numerics are HK codes (issue #2091 examples:
+        # 0001 长和 / 0941 中国移动), consistent with _is_hk_market,
+        # resolve_daily_stock_identity and parse_analysis_target.
+        assert is_code_like("0001") is True
+        assert is_code_like("0941") is True
+        assert is_code_like("6001") is True
 
     # --- Suffix format ---
     def test_suffix_sh(self):
@@ -241,6 +246,14 @@ class TestNormalizeCode:
 
     def test_plain_5_digit(self):
         assert normalize_code("00700") == "00700"
+
+    def test_plain_4_digit_canonicalizes_to_hk(self):
+        # Bare 4-digit numerics follow the HK contract (issue #2164 / PR #2163):
+        # canonicalize to the padded HK form so import/merge and config-driven
+        # analysis keep the HK market context instead of persisting the raw code.
+        assert normalize_code("0001") == "HK00001"
+        assert normalize_code("0941") == "HK00941"
+        assert normalize_code("1810") == "HK01810"
 
     def test_whitespace_stripped(self):
         assert normalize_code("  600519  ") == "600519"
@@ -352,12 +365,18 @@ class TestResolveIndexStockCodeForAnalysis:
         with patch("src.data.stock_index_loader.resolve_index_stock_code", return_value="005930.KS"):
             assert resolve_index_stock_code_for_analysis("005930") == "005930.KS"
 
-    def test_resolves_indexed_4_digit_jp_base(self):
-        assert is_code_like("7203") is False
+    def test_bare_4_digit_code_keeps_hk_contract_before_index_lookup(self):
+        # A bare 4-digit value is ambiguous with JP aliases such as 7203.
+        # The shared input contract treats it as HK; JP requires an explicit
+        # Yahoo suffix to preserve the market context.
+        assert is_code_like("7203") is True
         with patch("src.data.stock_index_loader.resolve_index_stock_code", return_value="7203.T"):
-            assert resolve_index_stock_code_for_analysis("7203") == "7203.T"
+            assert resolve_index_stock_code_for_analysis("7203") == "HK07203"
+
+        assert resolve_index_stock_code_for_analysis("7203.T") == "7203.T"
 
     def test_falls_back_to_canonical_when_index_miss(self):
         with patch("src.data.stock_index_loader.resolve_index_stock_code", return_value=None):
             assert resolve_index_stock_code_for_analysis("005930") == "005930"
+            assert resolve_index_stock_code_for_analysis("0001") == "HK00001"
             assert resolve_index_stock_code_for_analysis("AAPL") == "AAPL"
