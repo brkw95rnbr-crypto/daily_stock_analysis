@@ -22,7 +22,7 @@ import re
 import time
 import threading
 import contextvars
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -351,7 +351,10 @@ def run_agent_loop(
         progress_callback: Optional callback receiving progress dicts.
         thinking_labels: Override map of tool_name → friendly label.
         max_wall_clock_seconds: Optional overall timeout budget for the loop.
-        tool_call_timeout_seconds: Optional timeout for one parallel tool batch.
+        tool_call_timeout_seconds: Optional explicit per-run tool-call timeout.
+                  Highest-priority (first-wins) in the per-tool timeout chain —
+                  overrides per-tool declarations and category defaults — but is
+                  capped by ``max_wall_clock_seconds`` when both are set.
         emit_stage_events: Whether to emit the synthetic ``agent_loop``
             stage lifecycle. Orchestrated business stages disable this so
             ``stage_start`` / ``stage_done`` only describe real stages.
@@ -512,13 +515,10 @@ def run_agent_loop(
                 assistant_msg["provider_blocks"] = response.provider_blocks
             messages.append(assistant_msg)
 
-            # Execute tools (parallel when > 1)
-            effective_tool_timeout = tool_call_timeout_seconds
-            if remaining_timeout is not None:
-                effective_tool_timeout = min(
-                    remaining_timeout,
-                    tool_call_timeout_seconds if tool_call_timeout_seconds and tool_call_timeout_seconds > 0 else remaining_timeout,
-                )
+            # Execute tools (parallel when > 1).  ``tool_call_timeout_seconds`` is
+            # the caller's explicit per-run override — highest priority in the
+            # first-wins chain (Issue #1890 contract) — while ``remaining_timeout``
+            # is the unbreakable outer wall-clock cap for this batch.
             tool_results = _execute_tools(
                 response.tool_calls,
                 tool_registry,
@@ -526,7 +526,8 @@ def run_agent_loop(
                 progress_callback,
                 tool_calls_log,
                 non_retriable_tool_results,
-                tool_wait_timeout_seconds=effective_tool_timeout,
+                tool_call_timeout_seconds=tool_call_timeout_seconds,
+                tool_wait_timeout_seconds=remaining_timeout,
                 stock_scope=stock_scope,
             )
 
@@ -644,49 +645,64 @@ def _build_timeout_result_payload(
         "retriable": False,
     })
     if non_retriable_tool_results is not None:
-        non_retriable_tool_results[_build_tool_cache_key(tool_name, arguments)] = result_str
+        cache_key = _build_tool_cache_key(tool_name, arguments)
+        # Non-dict / missing ``arguments`` yields ``None`` here; skip the write so
+        # unrelated no-arg tool calls cannot collide on a shared ``None`` key.
+        if cache_key:
+            non_retriable_tool_results[cache_key] = result_str
     return result_str
 
 
 def _resolve_per_tool_timeout(
     tool_call,
     tool_registry: Optional[ToolRegistry],
-    global_timeout: Optional[float],
+    explicit_timeout: Optional[float] = None,
+    wall_clock_budget: Optional[float] = None,
 ) -> Optional[float]:
     """Resolve the effective timeout for a single tool call (Issue #1890).
 
-    Precedence is *first-wins within the registry fallback*, then the global
-    ``tool_call_timeout_seconds`` / remaining wall-clock budget acts as an
-    unbreakable outer cap:
+    Precedence is *first-wins*, exactly as confirmed in the issue contract:
 
-        1. explicit per-tool timeout (``ToolDefinition.timeout_seconds``)
-        2. category default (``AGENT_*_TOOL_TIMEOUT_S``)
-        3. none (no per-tool limit)
+        1. explicit per-run timeout (``tool_call_timeout_seconds``)
+        2. per-tool declaration (``ToolDefinition.timeout_seconds``)
+        3. category default (``AGENT_*_TOOL_TIMEOUT_S``)
+        4. none (no per-tool limit)
 
-    The explicit per-tool value therefore has the **highest** precedence and is
-    never lowered by a smaller category default — the previous ``min()`` across
-    all levels silently let a category default override an explicit per-tool
-    declaration.  The global budget still caps the result, so a long per-tool
-    timeout can never exceed the caller's overall budget.
+    An earlier level is never lowered by a later one: an explicit
+    ``tool_call_timeout_seconds`` can *relax* a stricter per-tool or category
+    default (the previous ``min()`` across all levels made that impossible), and
+    a per-tool declaration is never overridden by a smaller category default.
+
+    ``wall_clock_budget`` (the remaining overall loop budget) is then applied as
+    an *unbreakable outer cap*: the winner can never exceed it, so a long
+    explicit timeout cannot blow past the caller's overall wall-clock budget.
     """
-    global_budget = _coerce_positive_timeout(global_timeout)
+    explicit = _coerce_positive_timeout(explicit_timeout)
+    budget = _coerce_positive_timeout(wall_clock_budget)
+
     if tool_registry is None:
-        return global_budget
-    tool_def = tool_registry.get(tool_call.name)
-    if tool_def is None:
-        return global_budget
-
-    per_tool = _coerce_positive_timeout(getattr(tool_def, "timeout_seconds", None))
-    category = _coerce_positive_timeout(tool_registry.category_default_timeout(tool_def.category))
-
-    # First-wins registry fallback: explicit per-tool > category default.
-    base = per_tool if per_tool is not None else category
+        base = explicit
+    else:
+        tool_def = tool_registry.get(tool_call.name)
+        if tool_def is None:
+            base = explicit
+        else:
+            per_tool = _coerce_positive_timeout(getattr(tool_def, "timeout_seconds", None))
+            category = _coerce_positive_timeout(
+                tool_registry.category_default_timeout(tool_def.category)
+            )
+            # First-wins: explicit per-run > per-tool declaration > category default.
+            base = (
+                explicit
+                if explicit is not None
+                else (per_tool if per_tool is not None else category)
+            )
 
     if base is None:
-        # No per-tool/category limit; the global budget governs.
-        return global_budget
-    if global_budget is not None:
-        return min(base, global_budget)
+        # No explicit/per-tool/category limit; the wall-clock budget governs.
+        return budget
+    if budget is not None:
+        return min(base, budget)
     return base
 
 
@@ -697,12 +713,23 @@ def _execute_tools(
     progress_callback: Optional[Callable],
     tool_calls_log: List[Dict[str, Any]],
     non_retriable_tool_results: Optional[Dict[str, str]] = None,
+    tool_call_timeout_seconds: Optional[float] = None,
     tool_wait_timeout_seconds: Optional[float] = None,
     stock_scope: Optional[StockScope] = None,
 ) -> List[Dict[str, Any]]:
     """Execute one or more tool calls, returning ordered result dicts.
 
-    Single tools run inline; multiple tools run in parallel threads.
+    A single tool with no resolved timeout runs inline (no thread); otherwise
+    all tools share one executor whose per-tool timeouts are enforced by a
+    deadline-driven wait loop — there are no per-tool nested pools, so a batch
+    of N tools uses at most ``min(N, 5)`` threads (review: unify the single and
+    parallel timeout wrapping).  ``tool_wait_timeout_seconds`` also caps the
+    whole batch as an outer ceiling.
+
+    ``tool_call_timeout_seconds`` is the caller's explicit per-run override
+    (highest priority, first-wins) and ``tool_wait_timeout_seconds`` the
+    remaining wall-clock budget (outer cap) — both feed
+    :func:`_resolve_per_tool_timeout`.
     """
 
     def _exec_single(tc_item):
@@ -713,86 +740,28 @@ def _execute_tools(
             non_retriable_tool_results=non_retriable_tool_results,
         )
 
-    def _exec_single_with_timeout(tc_item, per_tool_timeout, cancel_event=None):
-        """Run a single tool call with an optional per-tool timeout.
-
-        Returns ``(result_6tuple, timed_out)``.  When the per-tool timeout
-        fires, a timeout-shaped 6-tuple is returned and ``timed_out`` is
-        ``True`` so the outer batch loop treats it as a completed result
-        rather than raising ``FuturesTimeoutError``.  A ``cancel_event``
-        (created here when not supplied) is armed on timeout so a still-running
-        handler can cooperate via ``is_tool_cancellation_requested()``.
-        """
-        if not per_tool_timeout or per_tool_timeout <= 0:
-            return _exec_single(tc_item), False
-        if cancel_event is None:
-            cancel_event = threading.Event()
-        pool = ThreadPoolExecutor(max_workers=1)
-        ctx = contextvars.copy_context()
-        ctx.run(TOOL_CANCEL_EVENT.set, cancel_event)
-        try:
-            future = pool.submit(ctx.run, _exec_single, tc_item)
-            try:
-                return future.result(timeout=per_tool_timeout), False
-            except FuturesTimeoutError:
-                future.cancel()
-                cancel_event.set()
-                result_str = _build_timeout_result_payload(
-                    tc_item.name, tc_item.arguments, per_tool_timeout, non_retriable_tool_results,
-                )
-                return (tc_item, result_str, False, round(per_tool_timeout, 2), False, None), True
-            finally:
-                pool.shutdown(wait=False, cancel_futures=True)
-        except Exception:  # pragma: no cover - defensive
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
-
-    results: List[Dict[str, Any]] = []
-
-    if len(tool_calls) == 1:
-        tc = tool_calls[0]
-        if progress_callback:
-            progress_callback(stream_event("tool_start", step=step, tool=tc.name))
-        per_tool_timeout = _resolve_per_tool_timeout(tc, tool_registry, tool_wait_timeout_seconds)
-        timeout_triggered = False
-        if per_tool_timeout and per_tool_timeout > 0:
-            pool = ThreadPoolExecutor(max_workers=1)
-            ctx = contextvars.copy_context()
-            cancel_event = threading.Event()
-            ctx.run(TOOL_CANCEL_EVENT.set, cancel_event)
-            try:
-                future = pool.submit(ctx.run, _exec_single, tc)
-                try:
-                    _, result_str, success, dur, cached, guard_result = future.result(timeout=per_tool_timeout)
-                except FuturesTimeoutError:
-                    timeout_triggered = True
-                    future.cancel()
-                    cancel_event.set()
-                    logger.warning("Tool '%s' timed out after %.2fs at step %d", tc.name, per_tool_timeout, step)
-                    result_str = _build_timeout_result_payload(
-                        tc.name, tc.arguments, per_tool_timeout, non_retriable_tool_results,
-                    )
-                    success = False
-                    dur = round(per_tool_timeout, 2)
-                    cached = False
-                    guard_result = None
-            finally:
-                pool.shutdown(wait=not timeout_triggered, cancel_futures=timeout_triggered)
+    def _record(tc_item, *, timed_out, timeout_s=None, out=None, guard_result=None):
+        """Emit ``tool_done``, build the log entry, and append to ``results``."""
+        if out is not None:
+            _, result_str, success, dur, cached, guard_result = out
         else:
-            _, result_str, success, dur, cached, guard_result = _exec_single(tc)
+            result_str = _build_timeout_result_payload(
+                tc_item.name, tc_item.arguments, timeout_s, non_retriable_tool_results,
+            )
+            success = False
+            dur = round(timeout_s, 2)
+            cached = False
         if progress_callback:
-            progress_callback(stream_event("tool_done", step=step, tool=tc.name, success=success, duration=dur))
+            progress_callback(stream_event(
+                "tool_done", step=step, tool=tc_item.name, success=success, duration=dur,
+            ))
         log_entry = {
-            "step": step, "tool": tc.name, "arguments": tc.arguments,
+            "step": step, "tool": tc_item.name, "arguments": tc_item.arguments,
             "success": success, "duration": dur, "result_length": len(result_str),
             "cached": cached,
         }
-        if per_tool_timeout and per_tool_timeout > 0 and not success:
-            try:
-                if json.loads(result_str).get("timeout") is True:
-                    log_entry["timeout"] = True
-            except (TypeError, ValueError, json.JSONDecodeError):
-                pass
+        if timed_out:
+            log_entry["timeout"] = True
         if guard_result is not None:
             log_entry.update({
                 "guarded": True,
@@ -801,90 +770,89 @@ def _execute_tools(
                 "allowed_stock_codes": guard_result.get("allowed_stock_codes", []),
             })
         tool_calls_log.append(log_entry)
-        results.append({"tc": tc, "result_str": result_str})
-    else:
-        for tc in tool_calls:
-            if progress_callback:
-                progress_callback(stream_event("tool_start", step=step, tool=tc.name))
+        results.append({"tc": tc_item, "result_str": result_str})
 
-        pool = ThreadPoolExecutor(max_workers=min(len(tool_calls), 5))
-        timeout_triggered = False
-        # Keyed by Future (not by tool name) so that two parallel calls to the
-        # same tool each get their own cancel event — a name-keyed dict would let
-        # one call's event shadow the other's on a batch timeout.
-        future_cancel: Dict = {}
-        try:
-            futures = {}
-            for tc in tool_calls:
-                per_tool_timeout = _resolve_per_tool_timeout(tc, tool_registry, tool_wait_timeout_seconds)
-                cancel_event = threading.Event()
-                fut = pool.submit(
-                    contextvars.copy_context().run,
-                    _exec_single_with_timeout, tc, per_tool_timeout, cancel_event,
-                )
-                future_cancel[fut] = cancel_event
-                futures[fut] = tc
-            pending = set(futures)
-            for future in as_completed(
-                futures,
-                timeout=tool_wait_timeout_seconds if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0 else None,
-            ):
-                pending.discard(future)
-                (tc_item, result_str, success, dur, cached, guard_result), timed_out = future.result()
-                if progress_callback:
-                    progress_callback(stream_event("tool_done", step=step, tool=tc_item.name, success=success, duration=dur))
-                log_entry = {
-                    "step": step, "tool": tc_item.name, "arguments": tc_item.arguments,
-                    "success": success, "duration": dur, "result_length": len(result_str),
-                    "cached": cached,
-                }
-                if timed_out:
-                    log_entry["timeout"] = True
-                if guard_result is not None:
-                    log_entry.update({
-                        "guarded": True,
-                        "expected_stock_code": guard_result.get("expected_stock_code"),
-                        "requested_stock_code": guard_result.get("requested_stock_code"),
-                        "allowed_stock_codes": guard_result.get("allowed_stock_codes", []),
-                    })
-                tool_calls_log.append(log_entry)
-                results.append({"tc": tc_item, "result_str": result_str})
-        except FuturesTimeoutError:
-            timeout_triggered = True
-            timeout_label = (
-                f"{tool_wait_timeout_seconds:.2f}s"
-                if tool_wait_timeout_seconds is not None
-                else "the configured limit"
+    results: List[Dict[str, Any]] = []
+    if not tool_calls:
+        return results
+
+    plan = []
+    for tc in tool_calls:
+        per_tool_timeout = _resolve_per_tool_timeout(
+            tc, tool_registry, tool_call_timeout_seconds, tool_wait_timeout_seconds,
+        )
+        plan.append((tc, per_tool_timeout))
+        if progress_callback:
+            progress_callback(stream_event("tool_start", step=step, tool=tc.name))
+
+    # Fast path: a single tool with no resolved timeout runs inline (no thread).
+    if len(plan) == 1 and not (plan[0][1] and plan[0][1] > 0):
+        _record(plan[0][0], timed_out=False, out=_exec_single(plan[0][0]))
+        return results
+
+    pool = ThreadPoolExecutor(max_workers=min(len(plan), 5))
+    futures: Dict[Any, Any] = {}
+    cancel_of: Dict[Any, threading.Event] = {}
+    deadline_of: Dict[Any, Optional[float]] = {}
+    timeout_of: Dict[Any, float] = {}
+    timeout_triggered = False
+    try:
+        # One executor for the whole batch.  Each future gets its own cancel
+        # event (keyed by Future, not by tool name, so two parallel calls to the
+        # same tool cannot shadow each other) and its own per-tool deadline.
+        for tc, per_tool_timeout in plan:
+            cancel_event = threading.Event()
+            ctx = contextvars.copy_context()
+            ctx.run(TOOL_CANCEL_EVENT.set, cancel_event)
+            fut = pool.submit(ctx.run, _exec_single, tc)
+            futures[fut] = tc
+            cancel_of[fut] = cancel_event
+            timeout_of[fut] = per_tool_timeout or 0.0
+            deadline_of[fut] = (
+                time.monotonic() + per_tool_timeout
+                if per_tool_timeout and per_tool_timeout > 0
+                else None
             )
-            logger.warning("Tool batch timed out after %s at step %d", timeout_label, step)
-            for future, tc_item in futures.items():
-                if future in pending:
-                    future.cancel()
-                    future_cancel[future].set()
-                    result_str = _build_timeout_result_payload(
-                        tc_item.name, tc_item.arguments,
-                        tool_wait_timeout_seconds, non_retriable_tool_results,
-                    )
-                    if progress_callback:
-                        progress_callback(stream_event(
-                            "tool_done",
-                            step=step,
-                            tool=tc_item.name,
-                            success=False,
-                            duration=round(tool_wait_timeout_seconds or 0.0, 2),
-                        ))
-                    tool_calls_log.append({
-                        "step": step,
-                        "tool": tc_item.name,
-                        "arguments": tc_item.arguments,
-                        "success": False,
-                        "duration": round(tool_wait_timeout_seconds or 0.0, 2),
-                        "result_length": len(result_str),
-                        "cached": False,
-                        "timeout": True,
-                    })
-                    results.append({"tc": tc_item, "result_str": result_str})
-        finally:
-            pool.shutdown(wait=not timeout_triggered, cancel_futures=timeout_triggered)
+
+        batch_deadline = (
+            time.monotonic() + tool_wait_timeout_seconds
+            if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0
+            else None
+        )
+        pending = set(futures)
+
+        while pending:
+            now = time.monotonic()
+            deadlines = [d for f in pending if (d := deadline_of.get(f)) is not None]
+            if batch_deadline is not None:
+                deadlines.append(batch_deadline)
+            next_deadline = min(deadlines) if deadlines else None
+            wait_timeout = max(0.0, next_deadline - now) if next_deadline is not None else None
+            done, _ = wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
+            for fut in done:
+                pending.discard(fut)
+                _record(futures[fut], timed_out=False, out=fut.result())
+
+            now = time.monotonic()
+            for fut in list(pending):
+                deadline = deadline_of.get(fut)
+                expired = (deadline is not None and now >= deadline) or (
+                    batch_deadline is not None and now >= batch_deadline
+                )
+                if not expired:
+                    continue
+                pending.discard(fut)
+                cancel_of[fut].set()
+                timeout_triggered = True
+                timeout_s = timeout_of.get(fut) or (tool_wait_timeout_seconds or 0.0)
+                logger.warning(
+                    "Tool '%s' timed out after %.2fs at step %d",
+                    futures[fut].name, timeout_s, step,
+                )
+                _record(futures[fut], timed_out=True, timeout_s=timeout_s)
+    finally:
+        # Do not wait when a timeout fired — the timed-out handler may still be
+        # running in a worker and would otherwise block this call indefinitely.
+        pool.shutdown(wait=not timeout_triggered, cancel_futures=True)
 
     return results

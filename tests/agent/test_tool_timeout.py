@@ -2,10 +2,10 @@
 """Unit tests for agent tool timeout resolution (Issue #1890).
 
 Covers:
-- the pure ``_resolve_tool_timeout`` candidate resolver (smallest positive wins)
 - registry / policy / definition timeout fields
-- ``_resolve_per_tool_timeout`` wiring
+- ``_resolve_per_tool_timeout`` wiring (first-wins precedence)
 - end-to-end ``_execute_tools`` per-tool timeout + fail-open behaviour
+- cooperative-cancel wiring into ``check_tool_execution``
 
 NOTE: ``ToolRegistry`` defines ``__len__`` but not ``__bool__``, so an *empty*
 registry is falsy in Python and ``@tool(registry=empty)`` falls back to the
@@ -15,6 +15,7 @@ of relying on the decorator's registry fallback.
 """
 import gc
 import json
+import re
 import sys
 import threading
 import time
@@ -33,7 +34,6 @@ from src.agent.tools.registry import (
     ToolDefinition,
     ToolPolicy,
     ToolRegistry,
-    _resolve_tool_timeout,
     tool,
 )
 from src.agent.runner import _execute_tools, _resolve_per_tool_timeout
@@ -41,36 +41,7 @@ from src.agent.tools.execution import _build_tool_cache_key
 
 
 # ---------------------------------------------------------------------------
-# 1. Pure resolver
-# ---------------------------------------------------------------------------
-class TestResolveToolTimeout:
-    def test_all_falsy_returns_none(self):
-        assert _resolve_tool_timeout(None, 0, None) is None
-
-    def test_returns_smallest_positive(self):
-        assert _resolve_tool_timeout(30, 5, 10) == 5
-
-    def test_ignores_none_and_zero(self):
-        assert _resolve_tool_timeout(None, 0, 12.5) == 12.5
-
-    def test_per_tool_smaller_than_category(self):
-        assert _resolve_tool_timeout(2, 10, 60) == 2
-
-    def test_category_smaller_than_global(self):
-        assert _resolve_tool_timeout(None, 15, 60) == 15
-
-    def test_global_only(self):
-        assert _resolve_tool_timeout(None, None, 45) == 45
-
-    def test_negative_ignored(self):
-        assert _resolve_tool_timeout(-1, 8, -5) == 8
-
-    def test_non_numeric_ignored(self):
-        assert _resolve_tool_timeout("oops", 9, None) == 9
-
-
-# ---------------------------------------------------------------------------
-# 2. Registry / policy / definition fields
+# 1. Registry / policy / definition fields
 # ---------------------------------------------------------------------------
 class TestRegistryTimeoutFields:
     def test_category_default_timeout_lookup(self):
@@ -119,23 +90,30 @@ class TestResolvePerToolTimeout:
     def test_per_tool_overrides_category(self):
         reg = ToolRegistry(category_timeout_map={"data": 30.0})
         _register(reg, "t", lambda: None, category="data", timeout_seconds=2.0)
-        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 60.0) == 2.0
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg) == 2.0
 
     def test_category_used_when_no_per_tool(self):
         reg = ToolRegistry(category_timeout_map={"data": 30.0})
         _register(reg, "t", lambda: None, category="data")
-        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 60.0) == 30.0
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg) == 30.0
 
-    def test_global_budget_caps_everything(self):
+    def test_explicit_per_run_beats_per_tool_and_category(self):
         reg = ToolRegistry(category_timeout_map={"data": 30.0})
         _register(reg, "t", lambda: None, category="data", timeout_seconds=2.0)
-        # remaining budget of 1.0 caps the resolved timeout
-        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 1.0) == 1.0
+        # first-wins: explicit tool_call_timeout_seconds is the highest priority.
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 60.0) == 60.0
 
-    def test_no_limits_returns_none(self):
+    def test_wall_clock_budget_caps_everything(self):
+        reg = ToolRegistry(category_timeout_map={"data": 30.0})
+        _register(reg, "t", lambda: None, category="data", timeout_seconds=2.0)
+        # remaining budget of 1.0 caps the resolved timeout.
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 60.0, 1.0) == 1.0
+
+    def test_no_limits_returns_budget_or_none(self):
         reg = ToolRegistry()
         _register(reg, "t", lambda: None, category="data")
-        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, None) is None
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg) is None
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, None, 5.0) == 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +193,45 @@ class TestExecuteToolsTimeout:
         )
         assert len(results) == 2
         assert all(json.loads(r["result_str"]).get("timeout") is True for r in results)
+
+    def test_mixed_fast_and_slow_parallel(self):
+        """Regression (review): a parallel batch mixing a fast and a slow tool
+        must let the fast one succeed while the slow one times out at its own
+        limit — the fast result is not blocked, the batch is bounded by the slow
+        tool's timeout, and each duration is accurate (the slow entry reports its
+        own per-tool timeout, not a batch-wide value).
+        """
+        reg = ToolRegistry(category_timeout_map={"data": 0.3})
+
+        def fast():
+            return {"ok": True}
+
+        def slow():
+            time.sleep(2.0)
+            return {"ok": True}
+
+        _register(reg, "fast", fast, category="data")
+        _register(reg, "slow", slow, category="data")
+        log = []
+        start = time.time()
+        results = _execute_tools(
+            [_make_tool_call("fast", tc_id="c1"), _make_tool_call("slow", tc_id="c2")],
+            reg, step=1, progress_callback=None, tool_calls_log=log,
+            tool_wait_timeout_seconds=None,
+        )
+        elapsed = time.time() - start
+
+        fast_res = next(r for r in results if r["tc"].name == "fast")
+        slow_res = next(r for r in results if r["tc"].name == "slow")
+        assert json.loads(fast_res["result_str"]).get("ok") is True
+        assert json.loads(slow_res["result_str"]).get("timeout") is True
+
+        fast_entry = next(e for e in log if e["tool"] == "fast")
+        slow_entry = next(e for e in log if e["tool"] == "slow")
+        assert fast_entry["success"] is True
+        assert slow_entry["timeout"] is True
+        assert slow_entry["duration"] == 0.3   # the slow tool's own limit, accurate
+        assert elapsed < 1.5                    # bounded by 0.3s, not the 2s body
 
 
 # ---------------------------------------------------------------------------
@@ -614,28 +631,64 @@ class TestToolRegistryCacheInvalidation:
 #    finite validation, cache thread-safety)
 # ---------------------------------------------------------------------------
 class TestFirstWinsTimeoutPrecedence:
-    """Blocker: an *explicit per-tool* timeout must outrank a smaller category
-    default.  The previous ``min()`` across all levels let a category default
-    silently override an explicit per-tool declaration.
+    """Blocker: first-wins precedence — explicit per-run
+    ``tool_call_timeout_seconds`` > per-tool declaration > category default >
+    none — with the remaining wall-clock budget as an unbreakable outer cap.
+    The previous ``min()`` across all levels let a smaller category default
+    override an explicit declaration and made an explicit per-run value unable
+    to relax a stricter per-tool timeout.
     """
 
     def test_explicit_per_tool_beats_smaller_category(self):
         reg = ToolRegistry(category_timeout_map={"data": 10.0})
         _register(reg, "t", lambda: None, category="data", timeout_seconds=30.0)
-        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 60.0) == 30.0
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg) == 30.0
 
     def test_explicit_per_tool_beats_larger_category(self):
         reg = ToolRegistry(category_timeout_map={"data": 50.0})
         _register(reg, "t", lambda: None, category="data", timeout_seconds=20.0)
-        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 120.0) == 20.0
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg) == 20.0
 
-    def test_global_budget_is_outer_cap_only(self):
+    def test_explicit_per_run_overrides_per_tool_and_category(self):
         reg = ToolRegistry(category_timeout_map={"data": 10.0})
         _register(reg, "t", lambda: None, category="data", timeout_seconds=30.0)
-        # base 30 capped to the 15s global budget.
+        # the caller's explicit per-run value relaxes a stricter per-tool 30s.
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 60.0) == 60.0
+        # and overrides a larger category default too.
         assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 15.0) == 15.0
-        # global disabled -> the explicit per-tool 30s stands.
-        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, None) == 30.0
+
+    def test_wall_clock_budget_is_outer_cap_only(self):
+        reg = ToolRegistry(category_timeout_map={"data": 10.0})
+        _register(reg, "t", lambda: None, category="data", timeout_seconds=30.0)
+        # base 30 capped to the 15s remaining budget.
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, None, 15.0) == 15.0
+        # explicit 60 also capped by the remaining budget.
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, 60.0, 15.0) == 15.0
+        # budget disabled -> the first-wins winner stands.
+        assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, None, None) == 30.0
+
+    def test_explicit_per_run_relaxes_per_tool_end_to_end(self):
+        reg = ToolRegistry(category_timeout_map={"data": 0.2})
+        calls = {"n": 0}
+
+        def slow():
+            calls["n"] += 1
+            time.sleep(0.8)
+            return {"ok": True}
+
+        _register(reg, "slow", slow, category="data", timeout_seconds=0.1)
+        results = _execute_tools(
+            [_make_tool_call("slow")], reg, step=1,
+            progress_callback=None, tool_calls_log=[],
+            tool_call_timeout_seconds=0.6,   # explicit override > per-tool 0.1s
+            tool_wait_timeout_seconds=None,
+        )
+        parsed = json.loads(results[0]["result_str"])
+        assert parsed.get("timeout") is True
+        # The effective timeout is the explicit 0.6s, not the 0.1s per-tool
+        # declaration — proving the explicit value won the first-wins chain.
+        match = re.search(r"after ([\d.]+)s", results[0]["result_str"])
+        assert match and abs(float(match.group(1)) - 0.6) < 0.05
 
 
 class TestTimeoutResultNonRetriable:
@@ -696,6 +749,28 @@ class TestTimeoutResultNonRetriable:
         assert json.loads(res2[0]["result_str"]).get("timeout") is True
         assert calls["n"] == first_calls  # handler never ran again
 
+    def test_timeout_with_non_dict_arguments_does_not_write_none_key(self):
+        """Regression: a timeout payload built from non-dict ``arguments``
+        (cache key ``None``) must not write a shared ``None`` entry into
+        ``non_retriable_tool_results``, which could alias unrelated no-arg calls.
+        """
+        reg = ToolRegistry(category_timeout_map={"data": 0.2})
+
+        def slow():
+            time.sleep(1.0)
+            return {"ok": True}
+
+        _register(reg, "slow", slow, category="data")
+        shared_non_retriable = {}
+        results = _execute_tools(
+            [_make_tool_call("slow", args=None)], reg, step=1,
+            progress_callback=None, tool_calls_log=[],
+            tool_wait_timeout_seconds=None,
+            non_retriable_tool_results=shared_non_retriable,
+        )
+        assert json.loads(results[0]["result_str"]).get("timeout") is True
+        assert None not in shared_non_retriable
+
 
 class TestTimeoutFiniteValidation:
     """Blocker: ``inf``/``nan``/negative ``AGENT_*_TOOL_TIMEOUT_S`` must degrade
@@ -726,11 +801,6 @@ class TestTimeoutFiniteValidation:
         _register(reg, "t", lambda: None, category="data", timeout_seconds=float("inf"))
         # inf must not survive into the resolved timeout.
         assert _resolve_per_tool_timeout(_make_tool_call("t"), reg, None) is None
-
-    def test_resolve_tool_timeout_ignores_inf_and_nan(self):
-        # inf/nan are skipped; the next positive candidate wins.
-        assert _resolve_tool_timeout(float("inf"), 12.0) == 12.0
-        assert _resolve_tool_timeout(float("nan"), 7.0, 0) == 7.0
 
 
 class TestToolRegistryCacheThreadSafety:
@@ -863,6 +933,46 @@ class TestTimeoutCooperativeCancel:
         assert parsed.get("timeout") is True
         assert parsed.get("retriable") is False
         assert captured["requested"] is True
+
+    def test_check_tool_execution_honors_runner_cancel(self):
+        """Regression: ``check_tool_execution()`` — the checkpoint real
+        data/backtest/tool-surface tools already call — must observe the
+        runner-armed ``TOOL_CANCEL_EVENT`` and abort a timed-out handler early,
+        instead of letting it run to completion in the background thread.
+        """
+        from src.agent.tools.execution import check_tool_execution
+
+        import time as _time
+
+        captured = {"completed": False}
+
+        def slow_handler(**kwargs):
+            # Poll the checkpoint the way data_tools / backtest_tools do.
+            deadline = _time.time() + 3.0
+            while _time.time() < deadline:
+                check_tool_execution()
+                _time.sleep(0.02)
+            captured["completed"] = True
+            return {"ok": True}
+
+        reg = ToolRegistry()
+        reg.register(ToolDefinition(
+            name="checkpoint_tool", description="s", parameters=[],
+            handler=slow_handler, category="data",
+        ))
+        tool_calls = [SimpleNamespace(name="checkpoint_tool", arguments={})]
+        results = _execute_tools(
+            tool_calls, reg, 1, None, [],
+            non_retriable_tool_results={},
+            tool_wait_timeout_seconds=0.1,
+        )
+        # The handler aborts at its next checkpoint shortly after the 0.1s
+        # timeout; it must NOT run its full 3s body to completion.
+        _time.sleep(0.8)
+        assert len(results) == 1
+        parsed = json.loads(results[0]["result_str"])
+        assert parsed.get("timeout") is True
+        assert captured["completed"] is False
 
 
 class TestGetToolRegistryReturnsLocalRegistry:

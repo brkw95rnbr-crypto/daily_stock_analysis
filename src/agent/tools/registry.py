@@ -11,7 +11,6 @@ Provides:
 import json
 import inspect
 import logging
-import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -434,43 +433,3 @@ def _infer_parameters(func: Callable) -> List[ToolParameter]:
         params.append(tp)
 
     return params
-
-
-def _resolve_tool_timeout(*candidates: Optional[float]) -> Optional[float]:
-    """Resolve an effective tool timeout as the minimum across candidates.
-
-    Accepts any number of candidate timeouts (e.g. explicit call argument,
-    per-tool declaration, category default, remaining wall-clock budget) and
-    returns the smallest positive, non-zero value.  ``None``/``0`` candidates
-    are ignored (treated as "no limit at this level").  Returns ``None`` when
-    no positive candidate exists, meaning "no per-tool timeout" — the caller's
-    global budget (if any) still applies.
-
-    The result is the *minimum* across all candidates so a per-tool or
-    category timeout can never exceed the caller's remaining budget.
-
-    .. note::
-       This is a generic "smallest positive candidate" helper and is **not**
-       the runtime precedence path.  Per-call timeout resolution for the agent
-       loop lives in :func:`src.agent.runner._resolve_per_tool_timeout`, which
-       applies *first-wins* precedence (explicit per-tool ``timeout_seconds`` >
-       category default > no limit) and only then caps the winner with the
-       global ``tool_call_timeout_seconds`` budget.  Do not use this helper to
-       reason about that contract.
-    """
-    effective: Optional[float] = None
-    for value in candidates:
-        if value is None:
-            continue
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            continue
-        # ``inf``/``nan`` are not valid timeouts: an ``inf`` would later raise
-        # ``OverflowError`` at ``future.result(timeout=inf)`` and ``nan`` yields
-        # undefined ordering.  Treat them as "no limit at this level".
-        if not math.isfinite(value) or value <= 0:
-            continue
-        if effective is None or value < effective:
-            effective = value
-    return effective
